@@ -6,8 +6,20 @@ dense LLM architectures (Llama-2, Llama-3.1, Qwen-2.5, Mistral-7B).
 ## Prerequisites
 
 - ROCm with hipBLASLt installed (`/opt/rocm/bin/hipblaslt-bench`)
-- hipBLASLt source tree with TensileLite built (set `TENSILE_WD` env var)
 - Python 3.8+
+
+## Setup
+
+```bash
+git clone --recursive https://github.com/Z-Y00/hipblaslt-tunning-helper.git
+cd hipblaslt-tunning-helper
+
+# Build TensileLite client (needed for Tensile benchmarking)
+cd hipblaslt/tensilelite
+pip3 install invoke
+invoke build-client
+cd ../..
+```
 
 ## Quick start
 
@@ -50,11 +62,21 @@ Batch sizes (MBS): 1, 2, 4
 
 ```
 ├── README.md
-├── config.py                  # Model configs and shape generation
+├── config.py                  # Imports from turbo submodule + shape generation
 ├── run_shapes.py              # Main tuning + comparison script
-└── templates/
-    └── bf16_gemm_gfx950.yaml  # Tensile YAML template (BF16, gfx950)
+├── templates/
+│   └── bf16_gemm_gfx950.yaml  # Tensile YAML template (BF16, gfx950)
+├── turbo/                     # Submodule: AMD-AGI/Primus-Turbo (benchmark configs)
+└── hipblaslt/                 # Submodule: Z-Y00/hipBLASLt @ cosmo-dev (patched TensileLite)
 ```
+
+### Submodules
+
+- **turbo** (`AMD-AGI/Primus-Turbo`): Provides `DenseModelConfigs` and shape
+  generation so tuning shapes stay in sync with upstream benchmarks.
+- **hipblaslt** (`Z-Y00/hipBLASLt`, branch `cosmo-dev`): Patched TensileLite
+  with fixes for TFLOPS reporting, rotating buffer overflow, hsaco filename
+  alias, empty assembly guards, and thread-local RNG for data init.
 
 ## How it works
 
@@ -76,5 +98,6 @@ For each shape, the script:
 ## Configuration
 
 - **Template**: Override with `--template path/to/custom.yaml`
-- **TensileLite path**: Set `TENSILE_WD` environment variable
+- **TensileLite path**: Defaults to `hipblaslt/tensilelite` submodule.
+  Override with `TENSILE_WD` environment variable.
 - **Output**: Set `--output-dir` (default: `tunning_results/`)

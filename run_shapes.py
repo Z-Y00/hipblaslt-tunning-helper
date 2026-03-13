@@ -32,17 +32,17 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from config import BATCH_SIZE_LIST, DenseModelConfigs, gen_all_shapes
+from config import gen_all_shapes
 
 WORKSPACE = Path(__file__).resolve().parent
 TEMPLATE_YAML = WORKSPACE / "templates" / "bf16_gemm_gfx950.yaml"
 OUTPUT_DIR = WORKSPACE / "tunning_results"
 HIPBLASLT_BENCH = "/opt/rocm/bin/hipblaslt-bench"
 
-# Tensile working directory — set TENSILE_WD env var or default to sibling hipblaslt repo
+# Tensile working directory — defaults to the hipblaslt submodule's tensilelite
 TENSILE_WD = Path(os.environ.get(
     "TENSILE_WD",
-    str(WORKSPACE.parent / "hipblaslt" / "tensilelite"),
+    str(WORKSPACE / "hipblaslt" / "tensilelite"),
 ))
 
 # ---------------------------------------------------------------------------

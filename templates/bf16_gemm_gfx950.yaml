@@ -1,81 +1,111 @@
 TestParameters:
-  marks: [skip-gfx900, skip-gfx906, skip-gfx908, skip-gfx90a, skip-gfx940, skip-gfx941, skip-gfx942, skip-gfx1010, skip-gfx1011, skip-gfx1012, skip-gfx1030, skip-gfx1100, skip-gfx1101, skip-gfx1102, skip-gfx1200, skip-gfx1201]
+  marks: [skip-gfx900, skip-gfx906, skip-gfx908, skip-gfx90a, skip-gfx940, skip-gfx941, skip-gfx942, skip-gfx1010, skip-gfx1011, skip-gfx1012, skip-gfx1030, skip-gfx1100, skip-gfx1101, skip-gfx1102, skip-gfx1200, skip-gfx1201] # not supported by arch
 
 GlobalParameters:
   SkipSlowSolutionRatio: 0.5
-  NumElementsToValidate: 128
-  NumWarmups: 20
+  NumElementsToValidate: 128 # skip full validation for fast tuning
+  NumWarmups: 20 # Lorri: get the latency stable
   NumBenchmarks: 1
   SyncsPerBenchmark: 1
-  EnqueuesPerSync: 30
-  CSVExportWinner: 1
+  EnqueuesPerSync: 30 # Lorri: set higher iters for avg
+  CSVExportWinner: 1 # Lorri: save the winner
   CSVMergeSameProblemID: 1
-  Device: 0
-  RotatingBufferSize: 512
-  SleepPercent: 0
+  Device: 0 # Lorri: must do everything on the same GPU, avoid GPU 2 GPU difference
+  RotatingBufferSize: 5120 # Lorri:  Note 1: should be larger than LLC, need to change higher for future GPU, Note 2: some Grouped gemm is very laerge, 512M may not be enough and failure would be druing data init phase, seting here to 5GB
+  SleepPercent: 0 # Lorri: we don't pause, more like real situation
   PrintLevel: 1
   PrintSolutionRejectionReason: True
+  #Device: 0
   CMakeBuildType: Release
   MergeFiles: False
   KernelTime: True
   MaxWorkspaceSize: 13421772800
   DataInitTypeA: 3
   DataInitTypeB: 3
+  #DataInitTypeC: 21
   DataInitTypeAlpha: 1
   DataInitTypeBeta: 0
+  #DataInitTypeBias: 21
   DataInitTypeScaleAlphaVec: 1
   DataInitTypeScaleA: 1
   DataInitTypeScaleB: 1
   MinKForGSU: 1
+  NumElementsToValidate: 128
+  # Failures due to this
   BoundsCheck: 2
   MaxLDS: 163840
   DeviceLDS: 163840
-  KeepBuildTmp: True
+  KeepBuildTmp: True # see knowledge.md
+  UseUserArgs: True
+  PrintSolutionRejectionReason: True # Lorri: Debugging
 
 BenchmarkProblems:
 
   ########################################
-  # BF16 TN — standard GEMM
+  # bf16 NN
   ########################################
   -
-    - # ProblemType
+    - # ProblemType # Lorri: see https://amd.atlassian.net/wiki/spaces/DCGPUAIST/pages/1116517153/hipblasLt+Grouped+Gemm+Tune
       OperationType: GEMM
-      DataType: b
-      DestDataType: b
+      DataType: h
+      DestDataType: h
       ComputeDataType: s
       HighPrecisionAccumulate: True
-      TransposeA: 1
+      TransposeA: 0
       TransposeB: 0
       UseBeta: True
       Batched: True
-      UseBias: 0
-    - # BenchmarkProblemSizeGroup
+      UseBias:       1
+      Activation:    True
+      ActivationType: hipblaslt_all
+      GroupedGemm:   True
+    - # BenchmarkProblemSizeGroup - Standard
       InitialSolutionParameters:
       BenchmarkCommonParameters:
         - KernelLanguage: ["Assembly"]
       ForkParameters:
-        - MatrixInstruction:
+        # Lorri: from hipblaslt/tensilelite/Tensile/Tests/common/gemm/gfx950/bf16_cvt.yaml
+        - MatrixInstruction: # see knowledge.md
           - [32, 32, 16, 1]
-          - [16, 16, 32, 1]
+          # - [32, 32, 4, 2]
+          # - [32, 32, 8, 1]
+          - [16, 16, 32, 1] # Lorri: see shorter mfma explanation in hipblaslt/tensilelite/Tensile/Utilities/tensile_generator/tensile_config_generator.py
+          # - [16, 16, 4, 4]
+          # - [16, 16, 16, 1]
+          # - [4, 4, 4, 16]
         - PrefetchGlobalRead: [2]
         - PrefetchLocalRead: [1]
-        - DepthU: [32, 64]
+  #        - ClusterLocalRead: [1]
+        # - DepthU: [32]
+        - DepthU: [32,64]
         - LocalReadVectorWidth: [-1]
         - ScheduleIterAlg: [3]
-        - TransposeLDS: [0, 1]
+          #        - ExpandPointerSwap: [0]
+        - TransposeLDS: [1] #0,1
         - LdsBlockSizePerPadA: [-1]
         - LdsBlockSizePerPadB: [-1]
         - LdsPadA: [-1]
         - LdsPadB: [-1]
-        - NonTemporalB: [0, 4]
+        # - NonTemporalB: [0]
+        - NonTemporalB: [0,4] # Lorri: allow non-temporal load for B to bypass cache coherency, we have to try both at tunning based on different gemm size
         - StaggerU: [0]
         - StaggerUStride: [16]
         - WorkGroupMappingXCC: [1, 8]
         - WorkGroupMappingXCCGroup: [-1]
         - 1LDSBuffer: [-1]
-        - GlobalSplitU: [1]
+        - GlobalSplitU: [-1] # see knowledge.md
+        - GlobalSplitUAlgorithm: ["MultipleBufferSingleKernel"]
+        #- PreloadKernArgs: [0, 1]
         - SourceSwap: [1]
       BenchmarkJoinParameters:
       BenchmarkFinalParameters:
-        - ProblemSizes:
-          - Exact: [4096, 4096, 1, 4096]
+        - ProblemSizes: # Lorri: see https://amd.atlassian.net/wiki/spaces/~7120202add2b96de67481bbcfa5e99f875033a/pages/833108349/Single+Grouped+GEMM+kernel
+          - Exact: [512,   5120, 1, 1536] # expecting 1PFLOPS (same as batched gemm) DeepSeek-V2-Down
+          - Exact: [512,   5120, 1, 1536] 
+          - Exact: [512,   5120, 1, 1536] 
+          - Exact: [512,   5120, 1, 1536] 
+          - Exact: [512,   5120, 1, 1536] 
+
+        - BiasTypeArgs: ['s']
+        - ActivationArgs:
+          - [Enum: none]

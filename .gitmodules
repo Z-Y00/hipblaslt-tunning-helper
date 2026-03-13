@@ -1,0 +1,7 @@
+[submodule "turbo"]
+	path = turbo
+	url = https://github.com/AMD-AGI/Primus-Turbo.git
+[submodule "hipblaslt"]
+	path = hipblaslt
+	url = https://github.com/Z-Y00/hipBLASLt.git
+	branch = cosmo-dev
