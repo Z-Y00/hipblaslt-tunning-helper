@@ -3,8 +3,9 @@
 Re-exports DenseModelConfigs and BATCH_SIZE_LIST from the turbo submodule
 so that shape definitions stay in sync with upstream benchmarks.
 
-Shapes are standard (non-grouped) GEMMs derived from dense LLM layers:
-  D = alpha * A(M×K) @ B(K×N)^T + beta * C
+Shapes are standard (non-grouped) GEMMs derived from dense LLM layers.
+The benchmark convention (bench_gemm_torch.py) is:
+  A (M×K) @ B (N×K)^T  →  BLAS column-major: TransposeA=T, TransposeB=N
 """
 
 import sys
@@ -20,9 +21,17 @@ from config import (  # noqa: E402
     gen_gemm_test_cases,
 )
 
+# Transpose convention from the turbo benchmark (bench_gemm_torch.py):
+#   a = randn(M, K);  b = randn(N, K);  out = a @ b.T
+# In BLAS column-major terms:
+#   Row-major (M,K) = col-major (K,M) → TransposeA = T
+#   Row-major (N,K) = col-major (K,N) → TransposeB = N
+TRANSPOSE_A = True   # "T" in hipblaslt-bench, 1 in Tensile YAML
+TRANSPOSE_B = False  # "N" in hipblaslt-bench, 0 in Tensile YAML
+
 
 def gen_all_shapes(model_filter=None):
-    """Generate all (model, layer, mbs, M, N, K) tuples across models and batch sizes."""
+    """Generate all (model, layer, mbs, M, N, K, trans_a, trans_b) tuples."""
     shapes = []
     for name, cfg in DenseModelConfigs.items():
         if model_filter and model_filter.lower() not in name.lower():
@@ -39,5 +48,7 @@ def gen_all_shapes(model_filter=None):
                     "M": M,
                     "N": N,
                     "K": K,
+                    "trans_a": TRANSPOSE_A,
+                    "trans_b": TRANSPOSE_B,
                 })
     return shapes

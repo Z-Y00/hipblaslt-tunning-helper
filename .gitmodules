@@ -5,3 +5,7 @@
 	path = hipblaslt
 	url = https://github.com/Z-Y00/hipBLASLt.git
 	branch = cosmo-dev
+[submodule "origami"]
+	path = origami
+	url = https://github.com/ROCm/rocm-libraries.git
+	shallow = true

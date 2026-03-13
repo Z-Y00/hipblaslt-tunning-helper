@@ -16,6 +16,7 @@ Usage:
   python3 run_shapes.py --gen-only
   python3 run_shapes.py --compare-only
   python3 run_shapes.py --run --parallel 8
+  python3 run_shapes.py --run --origami-top-n 30
 """
 
 import argparse
@@ -69,6 +70,100 @@ _MI_MAX_MT = 256
 _MI_MAX_WAVETILE = 8
 _MI_WAVEGROUP_COMBOS = [(2, 2), (4, 1), (1, 4)]
 
+# ---------------------------------------------------------------------------
+# Origami analytical tile ranking (optional, reduces search space)
+# ---------------------------------------------------------------------------
+_origami_available = False
+_ORIGAMI_PKG = str(WORKSPACE / "origami" / "shared" / "origami" / "python")
+if Path(_ORIGAMI_PKG).is_dir() and _ORIGAMI_PKG not in sys.path:
+    sys.path.insert(0, _ORIGAMI_PKG)
+try:
+    import origami as _origami
+    _origami_available = True
+except ImportError:
+    pass
+
+_origami_hw = None
+
+
+def _get_origami_hw():
+    global _origami_hw
+    if _origami_hw is None:
+        _origami_hw = _origami.get_hardware_for_device(0)
+    return _origami_hw
+
+
+def _trans_label(trans):
+    """Convert boolean transpose to single-char label (T or N)."""
+    return "T" if trans else "N"
+
+
+def _origami_filter_mi9(mi9_list, M, N, K, depth_u_values, top_n=30,
+                         trans_a=True, trans_b=False):
+    """Use Origami analytical model to rank MI9 configs and keep only the top N.
+
+    For each MI9 entry, compute the macro tile (MT_M, MT_N) and cross with
+    every DepthU value to build origami configs.  Rank them all, then return
+    only the MI9 entries whose tiles appear in the top-N results.
+    """
+    if not _origami_available:
+        return mi9_list
+
+    hw = _get_origami_hw()
+    prob = _origami.problem_t()
+    prob.size = _origami.dim3_t(M, N, K)
+    prob.batch = 1
+    prob.a_transpose = _origami.transpose_t.T if trans_a else _origami.transpose_t.N
+    prob.b_transpose = _origami.transpose_t.T if trans_b else _origami.transpose_t.N
+    prob.a_dtype = _origami.data_type_t.BFloat16
+    prob.b_dtype = _origami.data_type_t.BFloat16
+    prob.c_dtype = _origami.data_type_t.BFloat16
+    prob.d_dtype = _origami.data_type_t.BFloat16
+    prob.mi_dtype = _origami.data_type_t.BFloat16
+    prob.a_mx_block_size = 0
+    prob.b_mx_block_size = 0
+
+    configs = []
+    config_to_mi9_idx = []
+
+    for idx, mi9 in enumerate(mi9_list):
+        mi_M, mi_N, mi_K, mi_B, bm_val, tt0, tt1, wm, wn = mi9
+        mt_m = mi_M * bm_val * tt0 * wm
+        mt_n = mi_N * tt1 * wn
+        for du in depth_u_values:
+            c = _origami.config_t()
+            c.mt = _origami.dim3_t(mt_m, mt_n, du)
+            c.mi = _origami.dim3_t(mi_M, mi_N, mi_K)
+            c.occupancy = 1
+            configs.append(c)
+            config_to_mi9_idx.append(idx)
+
+    if not configs:
+        return mi9_list
+
+    ranked = _origami.select_topk_configs(prob, hw, configs, top_n)
+
+    surviving_tiles = set()
+    for r in ranked:
+        mt = r.config.mt
+        mi = r.config.mi
+        surviving_tiles.add((mt.m, mt.n, mi.m, mi.n, mi.k))
+
+    kept = []
+    kept_set = set()
+    for idx, mi9 in enumerate(mi9_list):
+        mi_M, mi_N, mi_K, mi_B, bm_val, tt0, tt1, wm, wn = mi9
+        mt_m = mi_M * bm_val * tt0 * wm
+        mt_n = mi_N * tt1 * wn
+        tile_key = (mt_m, mt_n, mi_M, mi_N, mi_K)
+        if tile_key in surviving_tiles:
+            k = tuple(mi9)
+            if k not in kept_set:
+                kept_set.add(k)
+                kept.append(mi9)
+
+    return kept if kept else mi9_list
+
 
 def _expand_mi4_for_shape(mi4_list, M, N, max_mt=_MI_MAX_MT, max_wt=_MI_MAX_WAVETILE):
     seen = set()
@@ -94,7 +189,22 @@ def _expand_mi4_for_shape(mi4_list, M, N, max_mt=_MI_MAX_MT, max_wt=_MI_MAX_WAVE
     return result
 
 
-def _expand_mi_in_header(header, M, N):
+def _parse_depth_u(header):
+    """Extract DepthU values from the YAML header, e.g. '- DepthU: [32,64]'."""
+    m = re.search(r"-\s*DepthU:\s*\[([^\]]+)\]", header)
+    if m:
+        return [int(x.strip()) for x in m.group(1).split(",")]
+    return [64]
+
+
+def _expand_mi_in_header(header, M, N, K=0, origami_top_n=0,
+                          trans_a=True, trans_b=False):
+    """Find MatrixInstruction entries in *header*.  If they are 4-element,
+    expand to 9-element entries sized for the given problem (M × N).
+
+    When *origami_top_n* > 0 and origami is available, the expanded MI9
+    list is pruned to only those tiles that origami ranks in the top N.
+    """
     lines = header.split("\n")
     mi_start_idx = None
     mi_first_entry = None
@@ -131,6 +241,18 @@ def _expand_mi_in_header(header, M, N):
         return header, len(mi4_list)
 
     mi9_list = _expand_mi4_for_shape(mi4_list, M, N)
+
+    if origami_top_n > 0 and _origami_available and K > 0:
+        depth_u_values = _parse_depth_u(header)
+        before = len(mi9_list)
+        mi9_list = _origami_filter_mi9(
+            mi9_list, M, N, K, depth_u_values, top_n=origami_top_n,
+            trans_a=trans_a, trans_b=trans_b,
+        )
+        if before != len(mi9_list):
+            print(f"    [origami] pruned MI9: {before} -> {len(mi9_list)}  "
+                  f"(top {origami_top_n} tiles)")
+
     entry_indent = lines[mi_first_entry][: len(lines[mi_first_entry]) - len(lines[mi_first_entry].lstrip())]
     new_mi_lines = []
     for mi9 in mi9_list:
@@ -171,16 +293,30 @@ def read_template(template_path=None):
     return "".join(header_lines), "".join(footer_lines)
 
 
-def gen_yaml(shape, header, footer, out_path):
+def gen_yaml(shape, header, footer, out_path, origami_top_n=0):
     M, N, K = shape["M"], shape["N"], shape["K"]
+    trans_a = bool(shape.get("trans_a", True))
+    trans_b = bool(shape.get("trans_b", False))
 
-    expanded_header, mi_count = _expand_mi_in_header(header, M, N)
+    expanded_header, mi_count = _expand_mi_in_header(
+        header, M, N, K=K, origami_top_n=origami_top_n,
+        trans_a=trans_a, trans_b=trans_b,
+    )
 
     rot_mb = compute_rotating_buffer_mb(M, N, K)
     expanded_header = re.sub(
         r"RotatingBufferSize:\s*\d+",
         f"RotatingBufferSize: {rot_mb}",
         expanded_header)
+
+    expanded_header = re.sub(
+        r"(TransposeA:\s*)[01]",
+        rf"\g<1>{1 if trans_a else 0}",
+        expanded_header, count=1)
+    expanded_header = re.sub(
+        r"(TransposeB:\s*)[01]",
+        rf"\g<1>{1 if trans_b else 0}",
+        expanded_header, count=1)
 
     exact_line = f"          - Exact: [{M}, {N}, 1, {K}]"
     content = expanded_header + exact_line + "\n" + footer
@@ -291,7 +427,8 @@ def parse_tensile_csv(case_dir):
 # hipblaslt-bench comparison
 # ---------------------------------------------------------------------------
 
-def run_hipblaslt_bench(M, N, K, iters=50, log_dir=None, device=None):
+def run_hipblaslt_bench(M, N, K, trans_a=True, trans_b=False,
+                        iters=50, log_dir=None, device=None):
     if not Path(HIPBLASLT_BENCH).exists():
         print(f"  hipblaslt-bench: SKIPPED (binary not found)")
         return None
@@ -303,7 +440,8 @@ def run_hipblaslt_bench(M, N, K, iters=50, log_dir=None, device=None):
         "--batch_count", "1",
         "--precision", "bf16_r",
         "--compute_type", "f32_r",
-        "--transA", "T", "--transB", "N",
+        "--transA", _trans_label(trans_a),
+        "--transB", _trans_label(trans_b),
         "-i", str(iters),
         "-j", "30",
         "--rotating", str(rot_mb),
@@ -321,7 +459,10 @@ def run_hipblaslt_bench(M, N, K, iters=50, log_dir=None, device=None):
         output = result.stdout + result.stderr
 
         if log_dir:
-            log_path = Path(log_dir) / f"hipblaslt_bench_M{M}_N{N}_K{K}.log"
+            log_path = Path(log_dir) / (
+                f"hipblaslt_bench_M{M}_N{N}_K{K}"
+                f"_TA{_trans_label(trans_a)}_TB{_trans_label(trans_b)}.log"
+            )
             with open(log_path, "w") as f:
                 f.write(output)
 
@@ -384,7 +525,10 @@ def _parse_hipblaslt_output(output):
 # ---------------------------------------------------------------------------
 
 def shape_id(s):
-    return f"{s['model']}_{s['layer']}_mbs{s['mbs']}_M{s['M']}_N{s['N']}_K{s['K']}"
+    ta = _trans_label(s.get("trans_a", True))
+    tb = _trans_label(s.get("trans_b", False))
+    return (f"{s['model']}_{s['layer']}_mbs{s['mbs']}"
+            f"_TA{ta}_TB{tb}_M{s['M']}_N{s['N']}_K{s['K']}")
 
 
 def _write_shape_report(row, path):
@@ -451,12 +595,17 @@ def _process_one_shape(shape, idx, total, header, footer, out_dir, args, device)
     yaml_path = out_dir / f"{sid}.yaml"
 
     tag = f"[{idx+1}/{total}] [GPU{device}]"
+    ta = _trans_label(shape.get("trans_a", True))
+    tb = _trans_label(shape.get("trans_b", False))
     _thread_print(f"\n{tag} {shape['model']} {shape['layer']}  "
-                  f"MBS={shape['mbs']} M={shape['M']} N={shape['N']} K={shape['K']}")
+                  f"MBS={shape['mbs']} M={shape['M']} N={shape['N']} K={shape['K']} "
+                  f"(transA={ta}, transB={tb})")
     _thread_print(f"{'─'*60}")
 
     if not args.compare_only:
-        _, mi_count = gen_yaml(shape, header, footer, yaml_path)
+        origami_n = getattr(args, "origami_top_n", 0) or 0
+        _, mi_count = gen_yaml(shape, header, footer, yaml_path,
+                               origami_top_n=origami_n)
         rot_mb = compute_rotating_buffer_mb(shape["M"], shape["N"], shape["K"])
         _thread_print(f"  {tag} YAML: {yaml_path.name}  "
                       f"({mi_count} MI configs, RotBuf={rot_mb} MB)")
@@ -478,6 +627,8 @@ def _process_one_shape(shape, idx, total, header, footer, out_dir, args, device)
     if args.run or args.compare_only:
         bench_result = run_hipblaslt_bench(
             shape["M"], shape["N"], shape["K"],
+            trans_a=shape.get("trans_a", True),
+            trans_b=shape.get("trans_b", False),
             log_dir=out_dir, device=device,
         )
 
@@ -485,6 +636,8 @@ def _process_one_shape(shape, idx, total, header, footer, out_dir, args, device)
         "model": shape["model"],
         "layer": shape["layer"],
         "mbs": shape["mbs"],
+        "transA": _trans_label(shape.get("trans_a", True)),
+        "transB": _trans_label(shape.get("trans_b", False)),
         "M": shape["M"],
         "N": shape["N"],
         "K": shape["K"],
@@ -514,28 +667,31 @@ def _process_one_shape(shape, idx, total, header, footer, out_dir, args, device)
 
 
 def print_report(results):
-    print(f"\n{'='*110}")
+    print(f"\n{'='*120}")
     print("COMPARISON REPORT: Tensile tuned BF16 GEMM vs hipblaslt-bench")
-    print(f"{'='*110}")
-    hdr = (f"{'Model':<18} {'Layer':<14} {'MBS':>4} {'M':>6} {'N':>6} {'K':>6}  "
+    print(f"{'='*120}")
+    hdr = (f"{'Model':<18} {'Layer':<14} {'MBS':>4} {'TA':>2} {'TB':>2} "
+           f"{'M':>6} {'N':>6} {'K':>6}  "
            f"{'Tensile':>10} {'Bench':>10} {'T/B':>8}")
     print(hdr)
-    print("-" * 110)
+    print("-" * 120)
     for r in results:
         t = r["tensile_tflops"]
         b = r["bench_tflops"]
         t_s = f"{t:.2f}" if t else "N/A"
         b_s = f"{b:.2f}" if b else "N/A"
-        tb = f"{t/b:.2%}" if (t and b and b > 0) else "N/A"
-        print(f"{r['model']:<18} {r['layer']:<14} {r['mbs']:>4} {r['M']:>6} "
-              f"{r['N']:>6} {r['K']:>6}  {t_s:>10} {b_s:>10} {tb:>8}")
-    print(f"{'='*110}")
+        ratio = f"{t/b:.2%}" if (t and b and b > 0) else "N/A"
+        print(f"{r['model']:<18} {r['layer']:<14} {r['mbs']:>4} "
+              f"{r.get('transA', 'T'):>2} {r.get('transB', 'N'):>2} "
+              f"{r['M']:>6} {r['N']:>6} {r['K']:>6}  "
+              f"{t_s:>10} {b_s:>10} {ratio:>8}")
+    print(f"{'='*120}")
 
 
 def save_report_csv(results, path):
     if not results:
         return
-    keys = ["model", "layer", "mbs", "M", "N", "K",
+    keys = ["model", "layer", "mbs", "transA", "transB", "M", "N", "K",
             "tensile_tflops", "tensile_time_us", "tensile_winner",
             "bench_tflops", "bench_time_us", "bench_kernel"]
     with open(path, "w", newline="") as f:
@@ -556,6 +712,7 @@ def main():
               python3 run_shapes.py --gen-only
               python3 run_shapes.py --compare-only
               python3 run_shapes.py --run --parallel 8
+              python3 run_shapes.py --run --origami-top-n 30
         """),
     )
     parser.add_argument("--list", action="store_true", help="List all shapes and exit")
@@ -579,6 +736,9 @@ def main():
                         help="Override YAML template path")
     parser.add_argument("--skip-tensile", action="store_true",
                         help="Skip Tensile runs (only run hipblaslt-bench)")
+    parser.add_argument("--origami-top-n", type=int, default=0, metavar="N",
+                        help="Use Origami analytical model to prune MI configs "
+                             "to the top N tiles per shape (0 = disabled)")
 
     args = parser.parse_args()
     out_dir = Path(args.output_dir).resolve()
@@ -588,11 +748,15 @@ def main():
         shapes = shapes[:args.max_shapes]
 
     if args.list:
-        print(f"{'#':>4}  {'Model':<18}  {'Layer':<14}  {'MBS':>4}  {'M':>6}  {'N':>6}  {'K':>6}")
-        print("-" * 75)
+        print(f"{'#':>4}  {'Model':<18}  {'Layer':<14}  {'MBS':>4}  "
+              f"{'TA':>2} {'TB':>2}  {'M':>6}  {'N':>6}  {'K':>6}")
+        print("-" * 82)
         for i, s in enumerate(shapes):
+            ta = _trans_label(s.get("trans_a", True))
+            tb = _trans_label(s.get("trans_b", False))
             print(f"{i+1:>4}  {s['model']:<18}  {s['layer']:<14}  "
-                  f"{s['mbs']:>4}  {s['M']:>6}  {s['N']:>6}  {s['K']:>6}")
+                  f"{s['mbs']:>4}  {ta:>2} {tb:>2}  "
+                  f"{s['M']:>6}  {s['N']:>6}  {s['K']:>6}")
         print(f"\nTotal shapes: {len(shapes)}")
         return
 
@@ -643,6 +807,8 @@ def main():
                         "model": shapes[idx]["model"],
                         "layer": shapes[idx]["layer"],
                         "mbs": shapes[idx]["mbs"],
+                        "transA": _trans_label(shapes[idx].get("trans_a", True)),
+                        "transB": _trans_label(shapes[idx].get("trans_b", False)),
                         **{k: shapes[idx][k] for k in ("M", "N", "K")},
                         "tensile_tflops": None, "tensile_time_us": None,
                         "tensile_winner": None, "bench_tflops": None,

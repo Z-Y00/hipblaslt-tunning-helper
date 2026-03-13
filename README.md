@@ -14,6 +14,18 @@ dense LLM architectures (Llama-2, Llama-3.1, Qwen-2.5, Mistral-7B).
 git clone --recursive https://github.com/Z-Y00/hipblaslt-tunning-helper.git
 cd hipblaslt-tunning-helper
 
+# The origami submodule uses sparse checkout (only shared/origami/ from rocm-libraries).
+# After clone, enable sparse checkout for it:
+cd origami
+git sparse-checkout init --cone
+git sparse-checkout set shared/origami
+cd ..
+
+# (Optional) Install Origami for analytical search-space pruning
+cd origami/shared/origami/python
+CMAKE_PREFIX_PATH=/opt/rocm CMAKE_CXX_COMPILER=/opt/rocm/bin/amdclang++ pip install -e .
+cd ../../../..
+
 # Build TensileLite client (needed for Tensile benchmarking)
 cd hipblaslt/tensilelite
 pip3 install invoke
@@ -42,6 +54,9 @@ python3 run_shapes.py --run --skip-tensile
 # Multi-GPU parallel
 python3 run_shapes.py --run --parallel 8
 python3 run_shapes.py --run --gpu-list 0,2,4,6
+
+# Use Origami to prune MI configs (top 30 tiles per shape)
+python3 run_shapes.py --run --origami-top-n 30
 ```
 
 ## Shapes
@@ -67,7 +82,8 @@ Batch sizes (MBS): 1, 2, 4
 ├── templates/
 │   └── bf16_gemm_gfx950.yaml  # Tensile YAML template (BF16, gfx950)
 ├── turbo/                     # Submodule: AMD-AGI/Primus-Turbo (benchmark configs)
-└── hipblaslt/                 # Submodule: Z-Y00/hipBLASLt @ cosmo-dev (patched TensileLite)
+├── hipblaslt/                 # Submodule: Z-Y00/hipBLASLt @ cosmo-dev (patched TensileLite)
+└── origami/                   # Submodule: ROCm/rocm-libraries (sparse: shared/origami only)
 ```
 
 ### Submodules
@@ -77,6 +93,25 @@ Batch sizes (MBS): 1, 2, 4
 - **hipblaslt** (`Z-Y00/hipBLASLt`, branch `cosmo-dev`): Patched TensileLite
   with fixes for TFLOPS reporting, rotating buffer overflow, hsaco filename
   alias, empty assembly guards, and thread-local RNG for data init.
+- **origami** (`ROCm/rocm-libraries`, sparse checkout of `shared/origami/`):
+  Analytical tile-selection model that predicts GEMM kernel performance without
+  benchmarking.  Used with `--origami-top-n N` to prune the MI config search
+  space.
+
+## Transpose convention
+
+The transpose settings are derived from the turbo benchmark (`bench_gemm_torch.py`)
+which computes `A(M×K) @ B(N×K).T`.  In BLAS column-major terms this maps to:
+
+| | Benchmark | hipblaslt-bench | Tensile YAML |
+|-|-----------|-----------------|--------------|
+| **A** | `(M, K)` row-major | `--transA T` | `TransposeA: 1` |
+| **B** | `(N, K)` row-major, transposed | `--transB N` | `TransposeB: 0` |
+
+The script reads `trans_a` / `trans_b` from each shape (set in `config.py`) and
+overrides the template YAML's `TransposeA` / `TransposeB` values accordingly.
+This ensures the tuning always matches the benchmark convention regardless of
+what the template file contains.
 
 ## How it works
 
