@@ -4,10 +4,9 @@
 # End-to-end workflow:
 #   1. Collect 3_LibraryLogic YAML files from tunning_results/
 #   2. Merge tuned logic into the hipblaslt base Equality logic
-#   3. Build hipblaslt from source (our fork, in-tree TensileLite)
-#   4. Install to /opt/rocm (or custom prefix)
-#   5. Verify with hipblaslt-bench (kernel dispatch check)
-#   6. Verify with turbo PyTorch GEMM (end-to-end check)
+#   3. Build + package + install hipblaslt via install.sh (deb)
+#   4. Verify with hipblaslt-bench (kernel dispatch check)
+#   5. Verify with turbo PyTorch GEMM (end-to-end check)
 #
 # Prerequisites:
 #   - Submodules initialized (run init_build.sh first)
@@ -18,10 +17,10 @@
 #   ./build_hipblaslt.sh                    # full pipeline
 #   ./build_hipblaslt.sh --merge-only       # only merge logic, skip build
 #   ./build_hipblaslt.sh --build-only       # skip merge, only build + install
-#   ./build_hipblaslt.sh --skip-install     # build but don't install
+#   ./build_hipblaslt.sh --skip-install     # build but don't package/install
 #   ./build_hipblaslt.sh --skip-verify      # skip post-install verification
-#   ./build_hipblaslt.sh --jobs 32          # parallel build jobs
-#   ./build_hipblaslt.sh --prefix=/opt/rocm
+#   ./build_hipblaslt.sh --gate-threshold 1.05  # only merge if T/B >= 1.05
+#   ./build_hipblaslt.sh --no-gate          # merge all, skip regression gate
 #
 # Verify tuned kernels at runtime:
 #   TENSILE_DB=32768 python3 your_benchmark.py
@@ -38,10 +37,8 @@ TENSILE_BIN="$TENSILE_DIR/Tensile/bin"
 ROCISA_LIB="$TENSILE_DIR/build_tmp/tensilelite/rocisa/lib"
 RESULTS_DIR="$SCRIPT_DIR/tunning_results"
 BASE_LOGIC="$HIPBLASLT_DIR/library/src/amd_detail/rocblaslt/src/Tensile/Logic/asm_full/gfx950/Equality"
-BUILD_DIR="$HIPBLASLT_DIR/build/release"
 INSTALL_PREFIX="/opt/rocm"
 GPU_ARCH="gfx950"
-JOBS="$(nproc)"
 
 export PYTHONPATH="${PYTHONPATH:-}:$ROCISA_LIB"
 
@@ -50,15 +47,16 @@ MERGE_ONLY=0
 BUILD_ONLY=0
 SKIP_INSTALL=0
 SKIP_VERIFY=0
+GATE_THRESHOLD="1.0"
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --merge-only)   MERGE_ONLY=1; shift ;;
-    --build-only)   BUILD_ONLY=1; shift ;;
-    --skip-install) SKIP_INSTALL=1; shift ;;
-    --skip-verify)  SKIP_VERIFY=1; shift ;;
-    --jobs)         shift; JOBS="${1:-$(nproc)}"; shift ;;
-    --jobs=*)       JOBS="${1#*=}"; shift ;;
-    --prefix=*)     INSTALL_PREFIX="${1#*=}"; shift ;;
+    --merge-only)       MERGE_ONLY=1; shift ;;
+    --build-only)       BUILD_ONLY=1; shift ;;
+    --skip-install)     SKIP_INSTALL=1; shift ;;
+    --skip-verify)      SKIP_VERIFY=1; shift ;;
+    --gate-threshold)   shift; GATE_THRESHOLD="${1:-1.0}"; shift ;;
+    --gate-threshold=*) GATE_THRESHOLD="${1#*=}"; shift ;;
+    --no-gate)          GATE_THRESHOLD="0"; shift ;;
     -h|--help)
       sed -n '2,/^set/{ /^#/s/^# \?//p }' "$0"; exit 0 ;;
     *) echo "Unknown option: $1"; shift ;;
@@ -70,18 +68,70 @@ log() { echo -e "\n\033[1;36m=== $* ===\033[0m"; }
 # =====================================================================
 # Steps 1-2: Collect and merge tuned logic
 # =====================================================================
+_get_approved_shapes() {
+  local csv="$1" threshold="$2"
+  python3 - "$csv" "$threshold" <<'PYEOF'
+import csv, sys, os
+csv_path, threshold = sys.argv[1], float(sys.argv[2])
+if threshold <= 0:
+    print("__ALL__")
+    sys.exit(0)
+if not os.path.isfile(csv_path):
+    print("__ALL__", file=sys.stderr)
+    print(f"  [gate] No report at {csv_path}, allowing all shapes", file=sys.stderr)
+    print("__ALL__")
+    sys.exit(0)
+approved, gated = [], []
+with open(csv_path) as f:
+    for row in csv.DictReader(f):
+        t = float(row.get("tensile_tflops") or 0)
+        b = float(row.get("bench_tflops") or 0)
+        trans = row.get("trans", "TNN")
+        shape_id = (f"{row['model']}_{row['layer']}_mbs{row['mbs']}"
+                    f"_{row.get('phase','fwd')}_{trans}"
+                    f"_M{row['M']}_N{row['N']}_K{row['K']}")
+        ratio = t / b if b > 0 else 0
+        if ratio >= threshold:
+            approved.append(shape_id)
+        else:
+            gated.append((shape_id, ratio))
+if gated:
+    print(f"  [gate] {len(gated)} shape(s) gated (T/B < {threshold:.2f}):", file=sys.stderr)
+    for sid, r in gated:
+        print(f"         {sid}  T/B={r:.2%}", file=sys.stderr)
+if approved:
+    print(f"  [gate] {len(approved)} shape(s) approved", file=sys.stderr)
+for s in approved:
+    print(s)
+PYEOF
+}
+
 merge_tuned_logic() {
-  log "Step 1/6: Collect tuned 3_LibraryLogic files"
+  log "Step 1/5: Collect tuned 3_LibraryLogic files (gate threshold=${GATE_THRESHOLD})"
 
   local merged_dir
   merged_dir=$(mktemp -d /tmp/hipblaslt_merged_logic.XXXXXX)
-  local count=0
+  local count=0 gated=0
 
-  for search_root in "$RESULTS_DIR"/bf16 "$RESULTS_DIR"/f8 "$RESULTS_DIR"/f8b8 "$RESULTS_DIR"; do
+  for search_root in "$RESULTS_DIR"/bf16 "$RESULTS_DIR"/f8 "$RESULTS_DIR"/f8b8; do
     [ -d "$search_root" ] || continue
-    for logic_dir in "$search_root"/*/3_LibraryLogic; do
-      [ -d "$logic_dir" ] || continue
-      for f in "$logic_dir"/*.yaml; do
+
+    local approved_list
+    approved_list=$(_get_approved_shapes "$search_root/comparison_report.csv" "$GATE_THRESHOLD")
+
+    for case_dir in "$search_root"/*/; do
+      [ -d "${case_dir}3_LibraryLogic" ] || continue
+      local folder_name
+      folder_name=$(basename "$case_dir")
+
+      if [ "$approved_list" != "__ALL__" ]; then
+        if ! echo "$approved_list" | grep -qxF "$folder_name"; then
+          gated=$((gated + 1))
+          continue
+        fi
+      fi
+
+      for f in "${case_dir}3_LibraryLogic/"*.yaml; do
         [ -f "$f" ] || continue
         cp "$f" "$merged_dir/"
         count=$((count + 1))
@@ -89,17 +139,17 @@ merge_tuned_logic() {
     done
   done
 
-  echo "  Found $count tuned logic file(s)"
+  echo "  Collected: $count logic file(s), gated: $gated shape(s)"
 
   if [ "$count" -eq 0 ]; then
     echo ""
-    echo "  WARNING: No 3_LibraryLogic directories found."
+    echo "  WARNING: No approved 3_LibraryLogic files found."
     echo "  Run tuning first: python3 run_shapes.py --run"
     rm -rf "$merged_dir"
     return 1
   fi
 
-  log "Step 2/6: Merge tuned logic into base library"
+  log "Step 2/5: Merge tuned logic into base library"
   echo "  Base:  $BASE_LOGIC"
   echo "  Tuned: $merged_dir ($count files)"
 
@@ -114,7 +164,7 @@ merge_tuned_logic() {
 }
 
 # =====================================================================
-# Step 3: Build hipblaslt from source
+# Step 3: Build + package + install hipblaslt via install.sh
 # =====================================================================
 
 # Known-broken logic files that cause VGPR overflow during asm codegen.
@@ -153,54 +203,36 @@ restore_quarantined_logic() {
   fi
 }
 
-build_hipblaslt() {
-  log "Step 3/6: Build hipBLASLt from source"
+build_and_install_hipblaslt() {
+  log "Step 3/5: Build & install hipBLASLt via install.sh (deb package)"
   echo "  Source:  $HIPBLASLT_DIR"
-  echo "  Build:   $BUILD_DIR"
   echo "  Arch:    $GPU_ARCH"
-  echo "  Jobs:    $JOBS"
-  echo "  Prefix:  $INSTALL_PREFIX"
+  echo "  Filter:  gfx950/Equality/*"
 
   quarantine_broken_logic
   trap 'restore_quarantined_logic' EXIT
 
-  mkdir -p "$BUILD_DIR"
-  cd "$BUILD_DIR"
+  cd "$HIPBLASLT_DIR"
 
-  CXX=/opt/rocm/bin/amdclang++
-  CC=/opt/rocm/bin/amdclang
+  local install_args=(
+    -i                                          # build + package + dpkg -i
+    -a "$GPU_ARCH"                              # GPU architecture
+    --skip_rocroller                            # no rocRoller backend
+    --logic-yaml-filter "gfx950/Equality/*"     # only compile gfx950 Equality logic
+  )
 
-  FC=gfortran CXX="$CXX" CC="$CC" \
-  cmake \
-    -DGPU_TARGETS="$GPU_ARCH" \
-    -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_CXX_COMPILER="$CXX" \
-    -DCMAKE_C_COMPILER="$CC" \
-    -DHIPBLASLT_ENABLE_FETCH=ON \
-    -DHIPBLASLT_ENABLE_ROCROLLER=OFF \
-    -DTENSILELITE_LOGIC_FILTER="gfx950/Equality/*" \
-    -DCPACK_SET_DESTDIR=OFF \
-    -DROCM_PATH="/opt/rocm" \
-    "$HIPBLASLT_DIR"
+  if [ "$SKIP_INSTALL" -eq 1 ]; then
+    # drop -i so it only builds, no package/install
+    install_args=( -a "$GPU_ARCH" --skip_rocroller --logic-yaml-filter "gfx950/Equality/*" )
+  fi
 
+  echo "  Running: ./install.sh ${install_args[*]}"
   echo ""
-  echo "  Building with make -j$JOBS ..."
-  make -j"$JOBS"
-  echo "  Build complete."
+  bash ./install.sh "${install_args[@]}"
 
   restore_quarantined_logic
   trap - EXIT
-}
 
-# =====================================================================
-# Step 4: Install
-# =====================================================================
-install_hipblaslt() {
-  log "Step 4/6: Install hipBLASLt to $INSTALL_PREFIX"
-  cd "$BUILD_DIR"
-  make install
-  echo "  Install complete."
   echo ""
   echo "  Installed library:"
   ls -lh "$INSTALL_PREFIX/lib/libhipblaslt"* 2>/dev/null || true
@@ -211,10 +243,10 @@ install_hipblaslt() {
 }
 
 # =====================================================================
-# Step 5: Verify via hipblaslt-bench
+# Step 4: Verify via hipblaslt-bench
 # =====================================================================
 verify_tuned_kernel() {
-  log "Step 5/6: Verify tuned kernels are dispatched (hipblaslt-bench)"
+  log "Step 4/5: Verify tuned kernels are dispatched (hipblaslt-bench)"
 
   local bench="$INSTALL_PREFIX/bin/hipblaslt-bench"
   if [ ! -x "$bench" ]; then
@@ -261,12 +293,12 @@ verify_tuned_kernel() {
 }
 
 # =====================================================================
-# Step 6: Verify via turbo PyTorch GEMM
+# Step 5: Verify via turbo PyTorch GEMM
 # =====================================================================
 TURBO_DIR="$SCRIPT_DIR/turbo"
 
 verify_turbo_pytorch() {
-  log "Step 6/6: Verify tuned kernel via turbo PyTorch GEMM"
+  log "Step 5/5: Verify tuned kernel via turbo PyTorch GEMM"
 
   if [ ! -d "$TURBO_DIR" ]; then
     echo "  turbo/ submodule not found, skipping PyTorch verification."
@@ -375,13 +407,9 @@ if [ "$MERGE_ONLY" -eq 1 ]; then
   exit 0
 fi
 
-build_hipblaslt
+build_and_install_hipblaslt
 
-if [ "$SKIP_INSTALL" -eq 0 ]; then
-  install_hipblaslt
-fi
-
-if [ "$SKIP_INSTALL" -eq 0 ] && [ "$SKIP_VERIFY" -eq 0 ]; then
+if [ "$SKIP_VERIFY" -eq 0 ]; then
   verify_tuned_kernel
   verify_turbo_pytorch
 fi
