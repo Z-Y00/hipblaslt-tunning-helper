@@ -20,7 +20,7 @@ Usage:
   python3 run_shapes.py --gen-only
   python3 run_shapes.py --compare-only
   python3 run_shapes.py --run --parallel 8
-  python3 run_shapes.py --run --origami-top-n 30
+  python3 run_shapes.py --run --origami-top-n 0   # disable origami pruning
   python3 run_shapes.py --run --fwd-only
 """
 
@@ -880,7 +880,7 @@ def main():
               python3 run_shapes.py --gen-only
               python3 run_shapes.py --compare-only
               python3 run_shapes.py --run --parallel 8
-              python3 run_shapes.py --run --origami-top-n 30
+              python3 run_shapes.py --run --origami-top-n 0   # disable origami
               python3 run_shapes.py --run --fwd-only
         """),
     )
@@ -909,9 +909,9 @@ def main():
                         help="Override YAML template path")
     parser.add_argument("--skip-tensile", action="store_true",
                         help="Skip Tensile runs (only run hipblaslt-bench)")
-    parser.add_argument("--origami-top-n", type=int, default=0, metavar="N",
+    parser.add_argument("--origami-top-n", type=int, default=30, metavar="N",
                         help="Use Origami analytical model to prune MI configs "
-                             "to the top N tiles per shape (0 = disabled)")
+                             "to the top N tiles per shape (default 30, 0 = disabled)")
     parser.add_argument("--fwd-only", action="store_true",
                         help="Only include forward GEMMs (TN); skip backward "
                              "grad_a (TT) and grad_b (NT)")
