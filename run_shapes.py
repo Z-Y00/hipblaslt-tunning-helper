@@ -344,7 +344,8 @@ def gen_yaml(shape, header, footer, out_path, origami_top_n=0):
 def run_tensile(yaml_path, case_dir, device=None):
     if device is not None:
         text = yaml_path.read_text()
-        text = re.sub(r"Device:\s*\d+", f"Device: {device}", text)
+        # HIP_VISIBLE_DEVICES remaps the physical GPU to index 0
+        text = re.sub(r"Device:\s*\d+", "Device: 0", text)
         yaml_path.write_text(text)
 
     env = os.environ.copy()
