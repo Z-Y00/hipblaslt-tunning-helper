@@ -103,3 +103,8 @@ BenchmarkProblems:
         - BiasTypeArgs: ['s']
         - ActivationArgs:
           - [Enum: none]
+LibraryLogic: # see hipblaslt/tensilelite/Tensile/Tests/common/gemm/gfx950/xfp32.yaml
+    ScheduleName: "gfx950"
+    DeviceNames: ["Device 0049", "Device 0050"]
+    ArchitectureName: "gfx950"
+    LibraryType: "Equality"
