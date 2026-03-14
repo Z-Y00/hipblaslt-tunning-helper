@@ -31,7 +31,6 @@ GlobalParameters:
   DataInitTypeScaleB: 1
   MinKForGSU: 1
   NumElementsToValidate: 128
-  # Failures due to this
   BoundsCheck: 2
   MaxLDS: 163840
   DeviceLDS: 163840
@@ -96,6 +95,7 @@ BenchmarkProblems:
         - GlobalSplitU: [-1] # see knowledge.md
         - GlobalSplitUAlgorithm: ["MultipleBufferSingleKernel"]
         #- PreloadKernArgs: [0, 1]
+        - StreamK: [0, 3]
         - SourceSwap: [1]
       BenchmarkJoinParameters:
       BenchmarkFinalParameters:

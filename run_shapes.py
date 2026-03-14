@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-Tensile tuning + hipblaslt-bench comparison for BF16 dense GEMM shapes.
+Tensile tuning + hipblaslt-bench comparison for dense GEMM shapes.
+
+Supports BF16 and FP8 (OCP E4M3, mixed E4M3/E5M2) data types.
 
 Shapes are derived from dense LLM architectures (Llama, Qwen, Mistral).
 For each shape the script:
@@ -12,6 +14,8 @@ For each shape the script:
 Usage:
   python3 run_shapes.py --list
   python3 run_shapes.py --run
+  python3 run_shapes.py --run --dtype f8
+  python3 run_shapes.py --run --dtype f8b8
   python3 run_shapes.py --run --filter "Llama-3.1-8B" --max-shapes 2
   python3 run_shapes.py --gen-only
   python3 run_shapes.py --compare-only
@@ -37,9 +41,25 @@ from pathlib import Path
 from config import gen_all_shapes
 
 WORKSPACE = Path(__file__).resolve().parent
-TEMPLATE_YAML = WORKSPACE / "templates" / "bf16_gemm_gfx950.yaml"
+TEMPLATES = {
+    "bf16": WORKSPACE / "templates" / "bf16_gemm_gfx950.yaml",
+    "f8":   WORKSPACE / "templates" / "f8_gemm_gfx950.yaml",
+    "f8b8": WORKSPACE / "templates" / "f8_gemm_gfx950.yaml",
+}
 OUTPUT_DIR = WORKSPACE / "tunning_results"
 HIPBLASLT_BENCH = "/opt/rocm/bin/hipblaslt-bench"
+
+# Tensile DataType codes per dtype flag
+_TENSILE_DTYPE = {"bf16": "b", "f8": "F8", "f8b8": "F8B8"}
+_TENSILE_DEST_DTYPE = {"bf16": "b", "f8": "b", "f8b8": "b"}
+
+_BENCH_PRECISION = {
+    "bf16": {"precision": "bf16_r"},
+    "f8":   {"precision": "f8_r"},
+    "f8b8": {"a_type": "f8_r", "b_type": "bf8_r"},
+}
+
+_FP8_DTYPES = {"f8", "f8b8"}
 
 # Tensile working directory — defaults to the hipblaslt submodule's tensilelite
 TENSILE_WD = Path(os.environ.get(
@@ -56,8 +76,10 @@ _MIN_ROTATIONS = 3
 _MAX_ROTATING_MB = 5120
 
 
-def compute_rotating_buffer_mb(M, N, K, elem_bytes=2):
-    tensor_set = (M * K + K * N + 2 * M * N) * elem_bytes
+def compute_rotating_buffer_mb(M, N, K, dtype="bf16"):
+    in_bytes = 1 if dtype in _FP8_DTYPES else 2
+    out_bytes = 2  # DestDataType is always BF16
+    tensor_set = (M * K + K * N) * in_bytes + 2 * M * N * out_bytes
     tensor_set_mb = tensor_set / (1024 * 1024)
     needed_mb = max(tensor_set_mb * _MIN_ROTATIONS, _GFX950_LLC_MB * 2)
     return min(int(math.ceil(needed_mb)), _MAX_ROTATING_MB)
@@ -104,8 +126,24 @@ def _trans_code(trans_a, trans_b):
     return _trans_label(trans_a) + _trans_label(trans_b) + "N"
 
 
+def _origami_dtype(dtype="bf16"):
+    """Map our dtype flag to origami data_type_t values for (a, b, output).
+
+    For mixed FP8 (f8b8), we set per-operand types.  The mi_dtype is set
+    to a_dtype since the MFMA instruction type follows A's format.
+    """
+    if not _origami_available:
+        return None, None, None
+    dt = _origami.data_type_t
+    if dtype == "f8":
+        return dt.Float8, dt.Float8, dt.BFloat16
+    elif dtype == "f8b8":
+        return dt.Float8, dt.BFloat8, dt.BFloat16
+    return dt.BFloat16, dt.BFloat16, dt.BFloat16
+
+
 def _origami_filter_mi9(mi9_list, M, N, K, depth_u_values, top_n=30,
-                         trans_a=True, trans_b=False):
+                         trans_a=True, trans_b=False, dtype="bf16"):
     """Use Origami analytical model to rank MI9 configs and keep only the top N.
 
     For each MI9 entry, compute the macro tile (MT_M, MT_N) and cross with
@@ -116,16 +154,18 @@ def _origami_filter_mi9(mi9_list, M, N, K, depth_u_values, top_n=30,
         return mi9_list
 
     hw = _get_origami_hw()
+    ab_dt, b_dt, out_dt = _origami_dtype(dtype)
+
     prob = _origami.problem_t()
     prob.size = _origami.dim3_t(M, N, K)
     prob.batch = 1
     prob.a_transpose = _origami.transpose_t.T if trans_a else _origami.transpose_t.N
     prob.b_transpose = _origami.transpose_t.T if trans_b else _origami.transpose_t.N
-    prob.a_dtype = _origami.data_type_t.BFloat16
-    prob.b_dtype = _origami.data_type_t.BFloat16
-    prob.c_dtype = _origami.data_type_t.BFloat16
-    prob.d_dtype = _origami.data_type_t.BFloat16
-    prob.mi_dtype = _origami.data_type_t.BFloat16
+    prob.a_dtype = ab_dt
+    prob.b_dtype = b_dt
+    prob.c_dtype = out_dt
+    prob.d_dtype = out_dt
+    prob.mi_dtype = ab_dt
     prob.a_mx_block_size = 0
     prob.b_mx_block_size = 0
 
@@ -204,7 +244,7 @@ def _parse_depth_u(header):
 
 
 def _expand_mi_in_header(header, M, N, K=0, origami_top_n=0,
-                          trans_a=True, trans_b=False):
+                          trans_a=True, trans_b=False, dtype="bf16"):
     """Find MatrixInstruction entries in *header*.  If they are 4-element,
     expand to 9-element entries sized for the given problem (M × N).
 
@@ -253,7 +293,7 @@ def _expand_mi_in_header(header, M, N, K=0, origami_top_n=0,
         before = len(mi9_list)
         mi9_list = _origami_filter_mi9(
             mi9_list, M, N, K, depth_u_values, top_n=origami_top_n,
-            trans_a=trans_a, trans_b=trans_b,
+            trans_a=trans_a, trans_b=trans_b, dtype=dtype,
         )
         if before != len(mi9_list):
             print(f"    [origami] pruned MI9: {before} -> {len(mi9_list)}  "
@@ -275,7 +315,7 @@ def _expand_mi_in_header(header, M, N, K=0, origami_top_n=0,
 # ---------------------------------------------------------------------------
 
 def read_template(template_path=None):
-    path = template_path or TEMPLATE_YAML
+    path = template_path or TEMPLATES["bf16"]
     with open(path) as f:
         lines = f.readlines()
     header_lines = []
@@ -299,26 +339,28 @@ def read_template(template_path=None):
     return "".join(header_lines), "".join(footer_lines)
 
 
-def gen_yaml(shape, header, footer, out_path, origami_top_n=0):
+def gen_yaml(shape, header, footer, out_path, origami_top_n=0, dtype="bf16"):
     M, N, K = shape["M"], shape["N"], shape["K"]
     trans_a = bool(shape.get("trans_a", True))
     trans_b = bool(shape.get("trans_b", False))
 
     expanded_header, mi_count = _expand_mi_in_header(
         header, M, N, K=K, origami_top_n=origami_top_n,
-        trans_a=trans_a, trans_b=trans_b,
+        trans_a=trans_a, trans_b=trans_b, dtype=dtype,
     )
 
-    rot_mb = compute_rotating_buffer_mb(M, N, K)
+    rot_mb = compute_rotating_buffer_mb(M, N, K, dtype=dtype)
     expanded_header = re.sub(
         r"RotatingBufferSize:\s*\d+",
         f"RotatingBufferSize: {rot_mb}",
         expanded_header)
 
+    tensile_dt = _TENSILE_DTYPE[dtype]
+    dest_dt = _TENSILE_DEST_DTYPE[dtype]
     expanded_header = re.sub(
-        r"(DataType:\s*)\w+", r"\g<1>b", expanded_header, count=1)
+        r"(DataType:\s*)\S+", rf"\g<1>{tensile_dt}", expanded_header, count=1)
     expanded_header = re.sub(
-        r"(DestDataType:\s*)\w+", r"\g<1>b", expanded_header, count=1)
+        r"(DestDataType:\s*)\S+", rf"\g<1>{dest_dt}", expanded_header, count=1)
 
     expanded_header = re.sub(
         r"(TransposeA:\s*)[01]",
@@ -329,7 +371,11 @@ def gen_yaml(shape, header, footer, out_path, origami_top_n=0):
         rf"\g<1>{1 if trans_b else 0}",
         expanded_header, count=1)
 
-    exact_line = f"          - Exact: [{M}, {N}, 1, {K}]"
+    is_batched = bool(re.search(r"Batched:\s*[Tt]rue", expanded_header))
+    if is_batched:
+        exact_line = f"          - Exact: [{M}, {N}, 1, {K}]"
+    else:
+        exact_line = f"          - Exact: [{M}, {N}, {K}]"
     content = expanded_header + exact_line + "\n" + footer
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:
@@ -375,7 +421,7 @@ def run_tensile(yaml_path, case_dir, device=None):
             elapsed = time.time() - t0
             hint = _tail_hint(log_path)
             print(f"\r  Tensile: {elapsed:6.0f}s  {hint[:60]:<60}", end="", flush=True)
-            time.sleep(5)
+            time.sleep(30)
 
     elapsed = time.time() - t0
     ok = proc.returncode == 0
@@ -440,17 +486,27 @@ def parse_tensile_csv(case_dir):
 # ---------------------------------------------------------------------------
 
 def run_hipblaslt_bench(M, N, K, trans_a=True, trans_b=False,
-                        iters=50, log_dir=None, device=None):
+                        iters=50, log_dir=None, device=None, dtype="bf16"):
     if not Path(HIPBLASLT_BENCH).exists():
         print(f"  hipblaslt-bench: SKIPPED (binary not found)")
         return None
 
-    rot_mb = compute_rotating_buffer_mb(M, N, K)
+    rot_mb = compute_rotating_buffer_mb(M, N, K, dtype=dtype)
     cmd = [
         HIPBLASLT_BENCH,
         "-m", str(M), "-n", str(N), "-k", str(K),
-        "--precision", "bf16_r",
-        "--compute_type", "f32_r",
+    ]
+    prec = _BENCH_PRECISION[dtype]
+    if "precision" in prec:
+        cmd += ["--precision", prec["precision"]]
+    else:
+        cmd += ["--a_type", prec["a_type"], "--b_type", prec["b_type"]]
+    if dtype in _FP8_DTYPES:
+        cmd += ["--compute_type", "f32_r", "--scale_type", "f32_r",
+                "--scaleA", "0", "--scaleB", "0"]
+    else:
+        cmd += ["--compute_type", "f32_r"]
+    cmd += [
         "--transA", _trans_label(trans_a),
         "--transB", _trans_label(trans_b),
         "-i", str(iters),
@@ -692,20 +748,22 @@ def _process_one_shape(shape, idx, total, header, footer, out_dir, args, device)
     sid = shape_id(shape)
     case_dir = out_dir / sid
     yaml_path = out_dir / f"{sid}.yaml"
+    dtype = getattr(args, "dtype", "bf16") or "bf16"
 
     tag = f"[{idx+1}/{total}] [GPU{device}]"
     code = _trans_code(shape.get("trans_a", True), shape.get("trans_b", False))
     phase = shape.get("phase", "fwd")
     _thread_print(f"\n{tag} {shape['model']} {shape['layer']} [{phase}]  "
                   f"MBS={shape['mbs']} M={shape['M']} N={shape['N']} K={shape['K']} "
-                  f"({code})")
+                  f"({code}) [{dtype}]")
     _thread_print(f"{'─'*60}")
 
     if not args.compare_only:
         origami_n = getattr(args, "origami_top_n", 0) or 0
         _, mi_count = gen_yaml(shape, header, footer, yaml_path,
-                               origami_top_n=origami_n)
-        rot_mb = compute_rotating_buffer_mb(shape["M"], shape["N"], shape["K"])
+                               origami_top_n=origami_n, dtype=dtype)
+        rot_mb = compute_rotating_buffer_mb(shape["M"], shape["N"], shape["K"],
+                                            dtype=dtype)
         _thread_print(f"  {tag} YAML: {yaml_path.name}  "
                       f"({mi_count} MI configs, RotBuf={rot_mb} MB)")
 
@@ -728,7 +786,7 @@ def _process_one_shape(shape, idx, total, header, footer, out_dir, args, device)
             shape["M"], shape["N"], shape["K"],
             trans_a=shape.get("trans_a", True),
             trans_b=shape.get("trans_b", False),
-            log_dir=out_dir, device=device,
+            log_dir=out_dir, device=device, dtype=dtype,
         )
 
     row = {
@@ -772,9 +830,10 @@ def _process_one_shape(shape, idx, total, header, footer, out_dir, args, device)
     return row
 
 
-def print_report(results):
+def print_report(results, dtype="bf16"):
+    dtype_label = dtype.upper()
     print(f"\n{'='*120}")
-    print("COMPARISON REPORT: Tensile tuned BF16 GEMM vs hipblaslt-bench")
+    print(f"COMPARISON REPORT: Tensile tuned {dtype_label} GEMM vs hipblaslt-bench")
     print(f"{'='*120}")
     hdr = (f"{'Model':<18} {'Layer':<14} {'Phase':<6} {'MBS':>4} {'Trans':>5} "
            f"{'M':>6} {'N':>6} {'K':>6}  "
@@ -809,12 +868,15 @@ def save_report_csv(results, path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="hipBLASLt BF16 GEMM Tensile tuning for dense LLM shapes",
+        description="hipBLASLt GEMM Tensile tuning for dense LLM shapes "
+                    "(BF16 / FP8 OCP / FP8 mixed)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             Examples:
               python3 run_shapes.py --list
               python3 run_shapes.py --run --filter "Llama-3.1-8B" --max-shapes 2
+              python3 run_shapes.py --run --dtype f8
+              python3 run_shapes.py --run --dtype f8b8
               python3 run_shapes.py --gen-only
               python3 run_shapes.py --compare-only
               python3 run_shapes.py --run --parallel 8
@@ -827,6 +889,10 @@ def main():
     parser.add_argument("--gen-only", action="store_true", help="Only generate YAML configs")
     parser.add_argument("--compare-only", action="store_true",
                         help="Only run comparison on existing results")
+    parser.add_argument("--dtype", type=str, default="bf16",
+                        choices=["bf16", "f8", "f8b8"],
+                        help="Data type: bf16, f8 (OCP E4M3), f8b8 (mixed "
+                             "E4M3 A / E5M2 B). Default: bf16")
     parser.add_argument("--filter", type=str, default=None,
                         help="Filter shapes by model name substring")
     parser.add_argument("--max-shapes", type=int, default=None,
@@ -851,7 +917,7 @@ def main():
                              "grad_a (TT) and grad_b (NT)")
 
     args = parser.parse_args()
-    out_dir = Path(args.output_dir).resolve()
+    out_dir = Path(args.output_dir).resolve() / args.dtype
 
     shapes = gen_all_shapes(model_filter=args.filter,
                             include_bwd=not args.fwd_only)
@@ -875,7 +941,10 @@ def main():
         parser.print_help()
         return
 
-    template_path = Path(args.template) if args.template else None
+    if args.template:
+        template_path = Path(args.template)
+    else:
+        template_path = TEMPLATES.get(args.dtype, TEMPLATES["bf16"])
     header, footer = read_template(template_path)
 
     if args.gpu_list:
@@ -929,7 +998,7 @@ def main():
 
     valid = [r for r in results if r is not None]
     if valid and (args.run or args.compare_only):
-        print_report(valid)
+        print_report(valid, dtype=args.dtype)
         save_report_csv(valid, out_dir / "comparison_report.csv")
 
 

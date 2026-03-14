@@ -1,0 +1,105 @@
+TestParameters:
+  marks: [skip-gfx900, skip-gfx906, skip-gfx908, skip-gfx90a, skip-gfx940, skip-gfx941, skip-gfx942, skip-gfx1010, skip-gfx1011, skip-gfx1012, skip-gfx1030, skip-gfx1100, skip-gfx1101, skip-gfx1102, skip-gfx1200, skip-gfx1201] # not supported by arch
+
+GlobalParameters:
+  SkipSlowSolutionRatio: 0.5
+  NumElementsToValidate: 128 # skip full validation for fast tuning
+  NumWarmups: 20
+  NumBenchmarks: 1
+  SyncsPerBenchmark: 1
+  EnqueuesPerSync: 30
+  CSVExportWinner: 1
+  CSVMergeSameProblemID: 1
+  Device: 0
+  RotatingBufferSize: 5120
+  SleepPercent: 0
+  PrintLevel: 1
+  PrintSolutionRejectionReason: True
+  CMakeBuildType: Release
+  MergeFiles: False
+  KernelTime: True
+  MaxWorkspaceSize: 13421772800
+  DataInitTypeA: 3
+  DataInitTypeB: 3
+  DataInitTypeAlpha: 1
+  DataInitTypeBeta: 0
+  DataInitTypeScaleAlphaVec: 1
+  DataInitTypeScaleA: 1
+  DataInitTypeScaleB: 1
+  MinKForGSU: 1
+  NumElementsToValidate: 128
+  BoundsCheck: 2
+  MaxLDS: 163840
+  DeviceLDS: 163840
+  KeepBuildTmp: True
+  PrintSolutionRejectionReason: True
+
+BenchmarkProblems:
+
+  ########################################
+  # FP8 (OCP E4M3) -> BF16 output, gfx950
+  ########################################
+  -
+    - # ProblemType
+      OperationType: GEMM
+      DataType: F8
+      DestDataType: b
+      ComputeDataType: S
+      HighPrecisionAccumulate: True
+      TransposeA: 0
+      TransposeB: 0
+      UseBeta: True
+      Batched: True
+      UseScaleAB: "Scalar"
+      UseScaleAlphaVec: 1
+      UseBias:       1
+      Activation:    True
+      ActivationType: hipblaslt_all
+      GroupedGemm:   False
+      BiasDataTypeList: [s]
+    - # BenchmarkProblemSizeGroup - Standard
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        - MatrixInstruction:
+          - [32, 32, 64, 1]   # gfx950 SMFMA
+          - [16, 16, 128, 1]  # gfx950 SMFMA
+        - PrefetchGlobalRead: [1, 2]
+        - PrefetchLocalRead: [1]
+        - ClusterLocalRead: [1]
+        - DepthU: [64, 128, 256]
+        - LocalReadVectorWidth: [-1]
+        - GlobalReadVectorWidthA: [8, 16]
+        - GlobalReadVectorWidthB: [8, 16]
+        - ScheduleIterAlg: [3]
+        - InnerUnroll: [1]
+        - ExpandPointerSwap: [1]
+        - TransposeLDS: [0, 1]
+        - DirectToLds: [0, 1]
+        - LdsBlockSizePerPadA: [-1]
+        - LdsBlockSizePerPadB: [-1]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        - NonTemporalB: [0, 4]
+        - StaggerU: [0]
+        - StaggerUStride: [16]
+        - WorkGroupMappingXCC: [1, 8]
+        - WorkGroupMappingXCCGroup: [-1]
+        - 1LDSBuffer: [-1]
+        - GlobalSplitU: [-1]
+        - GlobalSplitUAlgorithm: ["MultipleBufferSingleKernel"]
+        - StreamK: [0, 3]
+        - SourceSwap: [1]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes:
+          - Exact: [512,   5120, 1, 1536]
+          - Exact: [512,   5120, 1, 1536]
+          - Exact: [512,   5120, 1, 1536]
+          - Exact: [512,   5120, 1, 1536]
+          - Exact: [512,   5120, 1, 1536]
+
+        - BiasTypeArgs: ['s']
+        - ActivationArgs:
+          - [Enum: none]
