@@ -55,8 +55,10 @@ _TENSILE_DEST_DTYPE = {"bf16": "b", "f8": "b", "f8b8": "b"}
 
 _BENCH_PRECISION = {
     "bf16": {"precision": "bf16_r"},
-    "f8":   {"precision": "f8_r"},
-    "f8b8": {"a_type": "f8_r", "b_type": "bf8_r"},
+    "f8":   {"a_type": "f8_r", "b_type": "f8_r",
+             "c_type": "bf16_r", "d_type": "bf16_r"},
+    "f8b8": {"a_type": "f8_r", "b_type": "bf8_r",
+             "c_type": "bf16_r", "d_type": "bf16_r"},
 }
 
 _FP8_DTYPES = {"f8", "f8b8"}
@@ -72,16 +74,20 @@ TENSILE_WD = Path(os.environ.get(
 # ---------------------------------------------------------------------------
 
 _GFX950_LLC_MB = 256
-_MIN_ROTATIONS = 3
-_MAX_ROTATING_MB = 5120
+_MIN_ROTATIONS = 5
+_MAX_ROTATING_MB = 8192
+_FP8_ROTATION_SCALE = 5
 
 
 def compute_rotating_buffer_mb(M, N, K, dtype="bf16"):
     in_bytes = 1 if dtype in _FP8_DTYPES else 2
     out_bytes = 2  # DestDataType is always BF16
+    scale = _FP8_ROTATION_SCALE if dtype in _FP8_DTYPES else 1
     tensor_set = (M * K + K * N) * in_bytes + 2 * M * N * out_bytes
     tensor_set_mb = tensor_set / (1024 * 1024)
-    needed_mb = max(tensor_set_mb * _MIN_ROTATIONS, _GFX950_LLC_MB * 2)
+    if tensor_set_mb >= _GFX950_LLC_MB * 2:
+        return 0
+    needed_mb = max(tensor_set_mb * _MIN_ROTATIONS * scale, _GFX950_LLC_MB * 2)
     return min(int(math.ceil(needed_mb)), _MAX_ROTATING_MB)
 
 
@@ -90,7 +96,7 @@ def compute_rotating_buffer_mb(M, N, K, dtype="bf16"):
 # ---------------------------------------------------------------------------
 
 _MI_MAX_MT = 256
-_MI_MAX_WAVETILE = 8
+_MI_MAX_WAVETILE = 16
 _MI_WAVEGROUP_COMBOS = [(2, 2), (4, 1), (1, 4)]
 
 # ---------------------------------------------------------------------------
@@ -499,11 +505,12 @@ def run_hipblaslt_bench(M, N, K, trans_a=True, trans_b=False,
     prec = _BENCH_PRECISION[dtype]
     if "precision" in prec:
         cmd += ["--precision", prec["precision"]]
-    else:
+    if "a_type" in prec:
         cmd += ["--a_type", prec["a_type"], "--b_type", prec["b_type"]]
+    if "c_type" in prec:
+        cmd += ["--c_type", prec["c_type"], "--d_type", prec["d_type"]]
     if dtype in _FP8_DTYPES:
-        cmd += ["--compute_type", "f32_r", "--scale_type", "f32_r",
-                "--scaleA", "0", "--scaleB", "0"]
+        cmd += ["--compute_type", "f32_r", "--scaleA", "1", "--scaleB", "1"]
     else:
         cmd += ["--compute_type", "f32_r"]
     cmd += [
