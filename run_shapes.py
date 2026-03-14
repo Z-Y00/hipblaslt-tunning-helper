@@ -17,6 +17,7 @@ Usage:
   python3 run_shapes.py --compare-only
   python3 run_shapes.py --run --parallel 8
   python3 run_shapes.py --run --origami-top-n 30
+  python3 run_shapes.py --run --fwd-only
 """
 
 import argparse
@@ -96,6 +97,11 @@ def _get_origami_hw():
 def _trans_label(trans):
     """Convert boolean transpose to single-char label (T or N)."""
     return "T" if trans else "N"
+
+
+def _trans_code(trans_a, trans_b):
+    """Return 3-char hipBLASLt layout code for A, B, C (C is always N)."""
+    return _trans_label(trans_a) + _trans_label(trans_b) + "N"
 
 
 def _origami_filter_mi9(mi9_list, M, N, K, depth_u_values, top_n=30,
@@ -310,6 +316,11 @@ def gen_yaml(shape, header, footer, out_path, origami_top_n=0):
         expanded_header)
 
     expanded_header = re.sub(
+        r"(DataType:\s*)\w+", r"\g<1>b", expanded_header, count=1)
+    expanded_header = re.sub(
+        r"(DestDataType:\s*)\w+", r"\g<1>b", expanded_header, count=1)
+
+    expanded_header = re.sub(
         r"(TransposeA:\s*)[01]",
         rf"\g<1>{1 if trans_a else 0}",
         expanded_header, count=1)
@@ -437,7 +448,6 @@ def run_hipblaslt_bench(M, N, K, trans_a=True, trans_b=False,
     cmd = [
         HIPBLASLT_BENCH,
         "-m", str(M), "-n", str(N), "-k", str(K),
-        "--batch_count", "1",
         "--precision", "bf16_r",
         "--compute_type", "f32_r",
         "--transA", _trans_label(trans_a),
@@ -460,8 +470,8 @@ def run_hipblaslt_bench(M, N, K, trans_a=True, trans_b=False,
 
         if log_dir:
             log_path = Path(log_dir) / (
-                f"hipblaslt_bench_M{M}_N{N}_K{K}"
-                f"_TA{_trans_label(trans_a)}_TB{_trans_label(trans_b)}.log"
+                f"hipblaslt_bench_{_trans_code(trans_a, trans_b)}"
+                f"_M{M}_N{N}_K{K}.log"
             )
             with open(log_path, "w") as f:
                 f.write(output)
@@ -524,11 +534,70 @@ def _parse_hipblaslt_output(output):
 # Shape ID / reporting
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Kernel name parsing & diff
+# ---------------------------------------------------------------------------
+
+def _parse_kernel_params(kernel_name):
+    """Parse a Tensile kernel name into an ordered dict of parameter=value pairs.
+
+    Handles: KEY<digits>, KEYn<digits> (n = negative), bare-alpha tokens,
+    and multi-part values like WG32_8_1 and MIWT8_8.
+    """
+    if not kernel_name:
+        return {}
+    prefix_end = kernel_name.find("_MT")
+    if prefix_end == -1:
+        return {}
+    tag_section = kernel_name[prefix_end + 1:]
+    tokens = tag_section.split("_")
+    params = {}
+    last_key = None
+    for tok in tokens:
+        m = re.match(r'^([A-Za-z]+?)(n?\d.*)$', tok)
+        if m:
+            last_key = m.group(1)
+            params[last_key] = m.group(2)
+        elif re.match(r'^\d+$', tok) and last_key:
+            params[last_key] += "_" + tok
+        else:
+            last_key = tok
+            params[tok] = ""
+    return params
+
+
+def _kernel_param_diff(tensile_kernel, bench_kernel):
+    """Return (shared_diffs, tensile_only, bench_only) for parameters that differ.
+
+    shared_diffs: [(param, t_val, b_val)] - params in both but different values
+    tensile_only: [(param, val)] - params only in Tensile kernel
+    bench_only:   [(param, val)] - params only in bench kernel
+    """
+    tp = _parse_kernel_params(tensile_kernel)
+    bp = _parse_kernel_params(bench_kernel)
+    shared_diffs = []
+    tensile_only = []
+    bench_only = []
+    all_keys = list(dict.fromkeys(list(tp.keys()) + list(bp.keys())))
+    for k in all_keys:
+        tv = tp.get(k)
+        bv = bp.get(k)
+        if tv == bv:
+            continue
+        if tv is not None and bv is not None:
+            shared_diffs.append((k, tv, bv))
+        elif tv is not None:
+            tensile_only.append((k, tv))
+        else:
+            bench_only.append((k, bv))
+    return shared_diffs, tensile_only, bench_only
+
+
 def shape_id(s):
-    ta = _trans_label(s.get("trans_a", True))
-    tb = _trans_label(s.get("trans_b", False))
+    code = _trans_code(s.get("trans_a", True), s.get("trans_b", False))
+    phase = s.get("phase", "fwd")
     return (f"{s['model']}_{s['layer']}_mbs{s['mbs']}"
-            f"_TA{ta}_TB{tb}_M{s['M']}_N{s['N']}_K{s['K']}")
+            f"_{phase}_{code}_M{s['M']}_N{s['N']}_K{s['K']}")
 
 
 def _write_shape_report(row, path):
@@ -547,14 +616,17 @@ def _write_shape_report(row, path):
             return f"{val / b_tflops:.1%}"
         return "N/A"
 
+    phase = row.get("phase", "fwd")
     lines = [
-        f"# {row['model']} — {row['layer']}",
+        f"# {row['model']} — {row['layer']} [{phase}]",
         "",
         "| Parameter | Value |",
         "|-----------|-------|",
         f"| Model | {row['model']} |",
         f"| Layer | {row['layer']} |",
+        f"| Phase | {phase} |",
         f"| MBS | {row['mbs']} |",
+        f"| Trans (ABC) | {row.get('trans', 'TNN')} |",
         f"| M | {row['M']} |",
         f"| N | {row['N']} |",
         f"| K | {row['K']} |",
@@ -573,6 +645,32 @@ def _write_shape_report(row, path):
         f"- **hipblaslt-bench**: `{b_kernel or 'N/A'}`",
         "",
     ]
+
+    shared_diffs, t_only, b_only = _kernel_param_diff(t_kernel, b_kernel)
+    if shared_diffs or t_only or b_only:
+        lines += [
+            "## Parameter Differences (Tensile vs hipblaslt-bench)",
+            "",
+        ]
+        if shared_diffs:
+            lines += [
+                "| Parameter | Tensile | hipblaslt-bench |",
+                "|-----------|---------|-----------------|",
+            ]
+            for param, tv, bv in shared_diffs:
+                lines.append(f"| {param} | {tv} | {bv} |")
+            lines.append("")
+        if t_only:
+            lines.append("**Tensile-only params:** "
+                         + ", ".join(f"`{p}={v}`" if v else f"`{p}`"
+                                     for p, v in t_only))
+            lines.append("")
+        if b_only:
+            lines.append("**hipblaslt-bench-only params:** "
+                         + ", ".join(f"`{p}={v}`" if v else f"`{p}`"
+                                     for p, v in b_only))
+            lines.append("")
+
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")
 
@@ -595,11 +693,11 @@ def _process_one_shape(shape, idx, total, header, footer, out_dir, args, device)
     yaml_path = out_dir / f"{sid}.yaml"
 
     tag = f"[{idx+1}/{total}] [GPU{device}]"
-    ta = _trans_label(shape.get("trans_a", True))
-    tb = _trans_label(shape.get("trans_b", False))
-    _thread_print(f"\n{tag} {shape['model']} {shape['layer']}  "
+    code = _trans_code(shape.get("trans_a", True), shape.get("trans_b", False))
+    phase = shape.get("phase", "fwd")
+    _thread_print(f"\n{tag} {shape['model']} {shape['layer']} [{phase}]  "
                   f"MBS={shape['mbs']} M={shape['M']} N={shape['N']} K={shape['K']} "
-                  f"(transA={ta}, transB={tb})")
+                  f"({code})")
     _thread_print(f"{'─'*60}")
 
     if not args.compare_only:
@@ -635,9 +733,9 @@ def _process_one_shape(shape, idx, total, header, footer, out_dir, args, device)
     row = {
         "model": shape["model"],
         "layer": shape["layer"],
+        "phase": shape.get("phase", "fwd"),
         "mbs": shape["mbs"],
-        "transA": _trans_label(shape.get("trans_a", True)),
-        "transB": _trans_label(shape.get("trans_b", False)),
+        "trans": _trans_code(shape.get("trans_a", True), shape.get("trans_b", False)),
         "M": shape["M"],
         "N": shape["N"],
         "K": shape["K"],
@@ -663,6 +761,13 @@ def _process_one_shape(shape, idx, total, header, footer, out_dir, args, device)
         ratio = f"  (T/B={t/b:.0%})"
     _thread_print(f"  >> {' | '.join(parts)}{ratio}")
 
+    tw = row.get("tensile_winner")
+    bk = row.get("bench_kernel")
+    if tw:
+        _thread_print(f"  >> Tensile kernel: {tw}")
+    if bk:
+        _thread_print(f"  >> Bench kernel:   {bk}")
+
     return row
 
 
@@ -670,7 +775,7 @@ def print_report(results):
     print(f"\n{'='*120}")
     print("COMPARISON REPORT: Tensile tuned BF16 GEMM vs hipblaslt-bench")
     print(f"{'='*120}")
-    hdr = (f"{'Model':<18} {'Layer':<14} {'MBS':>4} {'TA':>2} {'TB':>2} "
+    hdr = (f"{'Model':<18} {'Layer':<14} {'Phase':<6} {'MBS':>4} {'Trans':>5} "
            f"{'M':>6} {'N':>6} {'K':>6}  "
            f"{'Tensile':>10} {'Bench':>10} {'T/B':>8}")
     print(hdr)
@@ -681,17 +786,17 @@ def print_report(results):
         t_s = f"{t:.2f}" if t else "N/A"
         b_s = f"{b:.2f}" if b else "N/A"
         ratio = f"{t/b:.2%}" if (t and b and b > 0) else "N/A"
-        print(f"{r['model']:<18} {r['layer']:<14} {r['mbs']:>4} "
-              f"{r.get('transA', 'T'):>2} {r.get('transB', 'N'):>2} "
+        print(f"{r['model']:<18} {r['layer']:<14} {r.get('phase', 'fwd'):<6} {r['mbs']:>4} "
+              f"{r.get('trans', 'TNN'):>5} "
               f"{r['M']:>6} {r['N']:>6} {r['K']:>6}  "
               f"{t_s:>10} {b_s:>10} {ratio:>8}")
-    print(f"{'='*120}")
+    print(f"{'='*128}")
 
 
 def save_report_csv(results, path):
     if not results:
         return
-    keys = ["model", "layer", "mbs", "transA", "transB", "M", "N", "K",
+    keys = ["model", "layer", "phase", "mbs", "trans", "M", "N", "K",
             "tensile_tflops", "tensile_time_us", "tensile_winner",
             "bench_tflops", "bench_time_us", "bench_kernel"]
     with open(path, "w", newline="") as f:
@@ -713,6 +818,7 @@ def main():
               python3 run_shapes.py --compare-only
               python3 run_shapes.py --run --parallel 8
               python3 run_shapes.py --run --origami-top-n 30
+              python3 run_shapes.py --run --fwd-only
         """),
     )
     parser.add_argument("--list", action="store_true", help="List all shapes and exit")
@@ -739,23 +845,27 @@ def main():
     parser.add_argument("--origami-top-n", type=int, default=0, metavar="N",
                         help="Use Origami analytical model to prune MI configs "
                              "to the top N tiles per shape (0 = disabled)")
+    parser.add_argument("--fwd-only", action="store_true",
+                        help="Only include forward GEMMs (TN); skip backward "
+                             "grad_a (TT) and grad_b (NT)")
 
     args = parser.parse_args()
     out_dir = Path(args.output_dir).resolve()
 
-    shapes = gen_all_shapes(model_filter=args.filter)
+    shapes = gen_all_shapes(model_filter=args.filter,
+                            include_bwd=not args.fwd_only)
     if args.max_shapes:
         shapes = shapes[:args.max_shapes]
 
     if args.list:
-        print(f"{'#':>4}  {'Model':<18}  {'Layer':<14}  {'MBS':>4}  "
-              f"{'TA':>2} {'TB':>2}  {'M':>6}  {'N':>6}  {'K':>6}")
-        print("-" * 82)
+        print(f"{'#':>4}  {'Model':<18}  {'Layer':<14}  {'Phase':<6}  {'MBS':>4}  "
+              f"{'Trans':>5}  {'M':>6}  {'N':>6}  {'K':>6}")
+        print("-" * 86)
         for i, s in enumerate(shapes):
-            ta = _trans_label(s.get("trans_a", True))
-            tb = _trans_label(s.get("trans_b", False))
-            print(f"{i+1:>4}  {s['model']:<18}  {s['layer']:<14}  "
-                  f"{s['mbs']:>4}  {ta:>2} {tb:>2}  "
+            code = _trans_code(s.get("trans_a", True), s.get("trans_b", False))
+            phase = s.get("phase", "fwd")
+            print(f"{i+1:>4}  {s['model']:<18}  {s['layer']:<14}  {phase:<6}  "
+                  f"{s['mbs']:>4}  {code:>5}  "
                   f"{s['M']:>6}  {s['N']:>6}  {s['K']:>6}")
         print(f"\nTotal shapes: {len(shapes)}")
         return
@@ -806,9 +916,10 @@ def main():
                     results[idx] = {
                         "model": shapes[idx]["model"],
                         "layer": shapes[idx]["layer"],
+                        "phase": shapes[idx].get("phase", "fwd"),
                         "mbs": shapes[idx]["mbs"],
-                        "transA": _trans_label(shapes[idx].get("trans_a", True)),
-                        "transB": _trans_label(shapes[idx].get("trans_b", False)),
+                        "trans": _trans_code(shapes[idx].get("trans_a", True),
+                                             shapes[idx].get("trans_b", False)),
                         **{k: shapes[idx][k] for k in ("M", "N", "K")},
                         "tensile_tflops": None, "tensile_time_us": None,
                         "tensile_winner": None, "bench_tflops": None,

@@ -26,11 +26,8 @@ cd origami/shared/origami/python
 CMAKE_PREFIX_PATH=/opt/rocm CMAKE_CXX_COMPILER=/opt/rocm/bin/amdclang++ pip install -e .
 cd ../../../..
 
-# Build TensileLite client (needed for Tensile benchmarking)
-cd hipblaslt/tensilelite
-pip3 install invoke
-invoke build-client
-cd ../..
+# Build TensileLite client and install Origami
+./init_build.sh
 ```
 
 ## Quick start
@@ -57,6 +54,28 @@ python3 run_shapes.py --run --gpu-list 0,2,4,6
 
 # Use Origami to prune MI configs (top 30 tiles per shape)
 python3 run_shapes.py --run --origami-top-n 30
+```
+
+## Full tuning run (nohup)
+
+Use `run_all.sh` for long-running tuning jobs.  It runs under `nohup` so
+it survives terminal disconnects, and saves output to a timestamped log.
+
+```bash
+# All models, fwd + bwd, 8 GPUs, origami pruning
+./run_all.sh
+
+# Filter to one model
+./run_all.sh --filter Llama-3.1-8B
+
+# Forward only
+./run_all.sh --fwd-only
+
+# Combine options
+./run_all.sh --filter Llama-3.1-8B --fwd-only --max-shapes 4
+
+# Follow the log
+tail -f tunning_results/run_all_*.log
 ```
 
 ## Shapes

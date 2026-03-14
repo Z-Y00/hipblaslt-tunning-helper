@@ -36,7 +36,6 @@ GlobalParameters:
   MaxLDS: 163840
   DeviceLDS: 163840
   KeepBuildTmp: True # see knowledge.md
-  UseUserArgs: True
   PrintSolutionRejectionReason: True # Lorri: Debugging
 
 BenchmarkProblems:
@@ -47,8 +46,8 @@ BenchmarkProblems:
   -
     - # ProblemType # Lorri: see https://amd.atlassian.net/wiki/spaces/DCGPUAIST/pages/1116517153/hipblasLt+Grouped+Gemm+Tune
       OperationType: GEMM
-      DataType: h
-      DestDataType: h
+      DataType: b
+      DestDataType: b
       ComputeDataType: s
       HighPrecisionAccumulate: True
       TransposeA: 0
@@ -58,7 +57,7 @@ BenchmarkProblems:
       UseBias:       1
       Activation:    True
       ActivationType: hipblaslt_all
-      GroupedGemm:   True
+      GroupedGemm:   False
     - # BenchmarkProblemSizeGroup - Standard
       InitialSolutionParameters:
       BenchmarkCommonParameters:
@@ -81,7 +80,8 @@ BenchmarkProblems:
         - LocalReadVectorWidth: [-1]
         - ScheduleIterAlg: [3]
           #        - ExpandPointerSwap: [0]
-        - TransposeLDS: [1] #0,1
+        - TransposeLDS: [0, 1] #0,1
+        - DirectToLds: [0, 1]
         - LdsBlockSizePerPadA: [-1]
         - LdsBlockSizePerPadB: [-1]
         - LdsPadA: [-1]
