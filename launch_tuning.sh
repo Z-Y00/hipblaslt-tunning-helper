@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Run BF16 dense GEMM tuning for all shapes using all 8 GPUs
-# with Origami analytical pruning (top 30 tiles per shape).
+# Run GEMM tuning for all shapes using all 8 GPUs
+# default with Origami analytical pruning (top 30 tiles per shape).
 #
 # Runs under nohup so it survives terminal disconnects.
-# Output is saved to a timestamped log in tunning_results/.
+# Output is saved to tunning_results/.
 #
 # Usage:
 #   ./run_all.sh                                # all models, fwd+bwd
