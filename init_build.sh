@@ -7,6 +7,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 apt update && apt install rocm-llvm-dev
+# lorri, clean up old build for persistent folder shared across docker containers
+rm -rf hipblaslt/build/
+rm -rf hipblaslt/tensilelite/build_tmp/
 export LLVM_DIR=/opt/rocm/llvm
 echo "=== Building TensileLite client ==="
 cd hipblaslt/tensilelite/
