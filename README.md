@@ -30,11 +30,11 @@ The other submodules are **not needed** for normal use:
 ### Build
 
 ```bash
-# Clone rocm-libraries, build hipBLASLt (creates tmp_rebuild/)
-./rebuild_hipblaslt.sh
-
-# Apply Tensile patches, build TensileLite client, install Origami
+# Clone rocm-libraries (sparse), apply patches, build TensileLite client, install Origami
 ./init_build.sh
+
+# (After tuning) Merge tuned kernels and rebuild hipBLASLt
+./rebuild_hipblaslt.sh
 ```
 
 ## Quick start

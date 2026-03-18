@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Rebuild hipBLASLt with tuned Tensile kernels merged in.
 #
-# Clones rocm-libraries into a temp directory (matching the Docker image build),
-# merges tuned 3_LibraryLogic YAML files, builds, packages, and installs.
+# Assumes init_build.sh has been run first (clones rocm-libraries into
+# tmp_rebuild/, applies patches, builds TensileLite client).
 #
 # Workflow:
-#   1. Clone rocm-libraries (same repo/commit as Docker image)
+#   1. Verify tmp_rebuild/rocm-libraries exists
 #   2. Collect 3_LibraryLogic YAML files from tunning_results/
 #   3. Merge tuned logic into the cloned hipblaslt Equality logic
 #   4. Build hipBLASLt via cmake (same command as Dockerfile)
@@ -23,13 +23,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# ── Source repo (must match reference/hipblaslt.Dockerfile) ───────────────
-HIPBLASLT_REPO="${HIPBLASLT_REPO:-https://github.com/ROCm/rocm-libraries.git}"
-HIPBLASLT_BRANCH="${HIPBLASLT_BRANCH:-b3db63927d3df09ec2f93d46e733d7a0ab51b87b}"
-
 # ── Paths ─────────────────────────────────────────────────────────────────
-TENSILE_BIN="$SCRIPT_DIR/hipblaslt/tensilelite/Tensile/bin"
-ROCISA_LIB="$SCRIPT_DIR/hipblaslt/tensilelite/build_tmp/tensilelite/rocisa/lib"
+MONO_REPO="$SCRIPT_DIR/tmp_rebuild/rocm-libraries"
+TENSILE_BIN="$MONO_REPO/projects/hipblaslt/tensilelite/Tensile/bin"
+ROCISA_LIB="$MONO_REPO/projects/hipblaslt/tensilelite/build_tmp/tensilelite/rocisa/lib"
 RESULTS_DIR="$SCRIPT_DIR/tunning_results"
 
 ROCM_PATH="${ROCM_PATH:-$(readlink -f /opt/rocm)}"
@@ -67,27 +64,43 @@ log()  { echo -e "\n\033[1;36m════ $* ════\033[0m"; }
 warn() { echo -e "\033[1;33m  WARN: $*\033[0m"; }
 
 # ══════════════════════════════════════════════════════════════════════════
-# Step 1: Clone rocm-libraries into a temp directory
+# Step 1: Verify rocm-libraries exists (created by init_build.sh)
 # ══════════════════════════════════════════════════════════════════════════
-clone_source() {
-  log "Step 1: Clone hipBLASLt source"
-  echo "  Repo:   $HIPBLASLT_REPO"
-  echo "  Commit: $HIPBLASLT_BRANCH"
+check_source() {
+  log "Step 1: Check + reset hipBLASLt source"
 
-  mkdir -p $SCRIPT_DIR/tmp_rebuild
-  BUILD_TMP=$SCRIPT_DIR/tmp_rebuild
-  echo "  Clone target: $BUILD_TMP"
+  if [ ! -d "$MONO_REPO/projects/hipblaslt" ]; then
+    echo "  ERROR: $MONO_REPO not found. Run ./init_build.sh first."
+    exit 1
+  fi
 
-  git clone "$HIPBLASLT_REPO" "$BUILD_TMP/rocm-libraries" || echo "folder exists, assume already cloned"
-  cd "$BUILD_TMP/rocm-libraries/projects/hipblaslt"
-  git clean -f # Lorri: since we are repeatly reuse the same folder
-  git reset --hard
-  git checkout "$HIPBLASLT_BRANCH"
-
-  HIPBLASLT_SRC="$BUILD_TMP/rocm-libraries/projects/hipblaslt"
+  HIPBLASLT_SRC="$MONO_REPO/projects/hipblaslt"
   BASE_LOGIC="$HIPBLASLT_SRC/library/src/amd_detail/rocblaslt/src/Tensile/Logic/asm_full/gfx950/Equality"
 
+  echo "  Source: $HIPBLASLT_SRC"
+
+  # Reset to clean state so previous merges don't contaminate this build.
+  # Patches from init_build.sh are re-applied after reset.
+  cd "$MONO_REPO"
+  echo "  Resetting to clean state..."
+  git checkout -- .
+  git clean -fd
   cd "$SCRIPT_DIR"
+
+  # Re-apply Cosmo patches (reset wiped them)
+  local patch="$SCRIPT_DIR/patches/0001-cosmo-tensile-tuning-fixes.rocm-libraries.patch"
+  if [ -f "$patch" ]; then
+    cd "$MONO_REPO"
+    if git apply --check "$patch" 2>/dev/null; then
+      git apply "$patch"
+      echo "  Re-applied Cosmo patches"
+    else
+      echo "  Patches already applied or not needed"
+    fi
+    cd "$SCRIPT_DIR"
+  fi
+
+  echo "  Logic:  $BASE_LOGIC"
 }
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -325,12 +338,10 @@ install_hipblaslt() {
 echo ">>  Rebuild hipBLASLt with tuned Tensile kernels"
 echo ">>  $(date)"
 echo ">>  ROCM_PATH=$ROCM_PATH  GPU_ARCH=$GPU_ARCH"
-echo ">>  Repo: $HIPBLASLT_REPO"
-echo ">>  Commit: $HIPBLASLT_BRANCH"
 
 OVERALL_START=$SECONDS
 
-clone_source
+check_source
 merge_tuned_logic || { warn "Merge failed or no files to merge"; [ "$MERGE_ONLY" -eq 1 ] && exit 1; }
 
 if [ "$MERGE_ONLY" -eq 1 ]; then
