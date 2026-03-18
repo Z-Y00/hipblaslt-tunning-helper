@@ -48,6 +48,7 @@ TEMPLATES = {
 }
 OUTPUT_DIR = WORKSPACE / "tunning_results"
 HIPBLASLT_BENCH = "/opt/rocm/bin/hipblaslt-bench"
+API_BENCH = str(WORKSPACE / "test_hipblaslt_api")
 
 # Tensile DataType codes per dtype flag
 _TENSILE_DTYPE = {"bf16": "b", "f8": "F8", "f8b8": "F8B8"}
@@ -620,6 +621,58 @@ def _parse_hipblaslt_output(output):
 
 
 # ---------------------------------------------------------------------------
+# API bench (Tensile-aligned timing via hipblasLtMatmul)
+# ---------------------------------------------------------------------------
+
+def run_api_bench(M, N, K, trans_a=True, trans_b=False,
+                  device=None, warmup=30, iters=50):
+    """Run test_hipblaslt_api in single-shape CSV mode.
+
+    Uses Tensile-exact timing (single event pair, total/N average,
+    random [-3,3] init, no rotating buffers) so its TFLOPS aligns
+    with Tensile's reported numbers.
+    """
+    if not Path(API_BENCH).exists():
+        print(f"  api-bench: SKIPPED (binary not found at {API_BENCH})")
+        return None
+
+    ta = "T" if trans_a else "N"
+    tb = "T" if trans_b else "N"
+    cmd = [
+        API_BENCH,
+        "-m", str(M), "-n", str(N), "-k", str(K),
+        "--transA", ta, "--transB", tb,
+        "--warmup", str(warmup), "--iters", str(iters),
+        "--csv",
+    ]
+    env = None
+    if device is not None:
+        env = os.environ.copy()
+        env["HIP_VISIBLE_DEVICES"] = str(device)
+        env["CUDA_VISIBLE_DEVICES"] = str(device)
+        cmd += ["--device", "0"]
+
+    print(f"  api-bench: running ...", end="", flush=True)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=120, env=env)
+        line = result.stdout.strip()
+        if result.returncode != 0 or not line:
+            err = result.stderr.strip()[:120]
+            print(f"\r  api-bench: FAILED (exit {result.returncode}) {err}")
+            return None
+        parts = line.split(",", 2)
+        avg_us = float(parts[0])
+        tflops = float(parts[1])
+        kernel = parts[2] if len(parts) > 2 else ""
+        print(f"\r  api-bench: {tflops:.1f} TFLOPS  ({avg_us:.1f} µs){' '*10}")
+        return {"tflops": tflops, "time_us": avg_us, "kernel_name": kernel}
+    except (subprocess.TimeoutExpired, Exception) as e:
+        print(f"\r  api-bench: ERROR ({e}){' '*20}")
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Shape ID / reporting
 # ---------------------------------------------------------------------------
 
@@ -696,13 +749,16 @@ def _write_shape_report(row, path):
     b_tflops = row.get("bench_tflops")
     b_us = row.get("bench_time_us")
     b_kernel = row.get("bench_kernel")
+    a_tflops = row.get("api_tflops")
+    a_us = row.get("api_time_us")
+    a_kernel = row.get("api_kernel")
 
     def _v(val, fmt=".2f", suffix=""):
         return f"{val:{fmt}}{suffix}" if val is not None else "N/A"
 
-    def _ratio(val):
-        if val is not None and b_tflops is not None and b_tflops > 0:
-            return f"{val / b_tflops:.1%}"
+    def _ratio(val, base):
+        if val is not None and base is not None and base > 0:
+            return f"{val / base:.1%}"
         return "N/A"
 
     phase = row.get("phase", "fwd")
@@ -723,20 +779,27 @@ def _write_shape_report(row, path):
         "",
         "## Results",
         "",
-        "| Method | TFLOPS | Time (us) | vs hipblaslt-bench |",
-        "|--------|-------:|----------:|-------------------:|",
-        f"| **Tensile tuned** | {_v(t_tflops)} | {_v(t_us)} | {_ratio(t_tflops)} |",
-        f"| **hipblaslt-bench (stock)** | {_v(b_tflops)} | {_v(b_us)} | — |",
+        "| Method | TFLOPS | Time (us) | vs Bench | vs API |",
+        "|--------|-------:|----------:|---------:|-------:|",
+        f"| **Tensile tuned** | {_v(t_tflops)} | {_v(t_us)} "
+        f"| {_ratio(t_tflops, b_tflops)} | {_ratio(t_tflops, a_tflops)} |",
+        f"| **API bench (installed)** | {_v(a_tflops)} | {_v(a_us)} "
+        f"| {_ratio(a_tflops, b_tflops)} | — |",
+        f"| **hipblaslt-bench (stock)** | {_v(b_tflops)} | {_v(b_us)} | — | — |",
         "",
     ]
-    if t_tflops and b_tflops and b_tflops > 0:
-        lines.append(f"> **Tuned/Bench ratio:** {t_tflops/b_tflops:.2%}")
+    if t_tflops and a_tflops and a_tflops > 0:
+        lines.append(f"> **Tuned/API ratio (gate metric):** {t_tflops/a_tflops:.2%}")
+        lines.append("")
+    elif t_tflops and b_tflops and b_tflops > 0:
+        lines.append(f"> **Tuned/Bench ratio (fallback):** {t_tflops/b_tflops:.2%}")
         lines.append("")
 
     lines += [
         "## Kernels",
         "",
         f"- **Tensile winner**: `{t_kernel or 'N/A'}`",
+        f"- **API bench (installed)**: `{a_kernel or 'N/A'}`",
         f"- **hipblaslt-bench**: `{b_kernel or 'N/A'}`",
         "",
     ]
@@ -830,6 +893,7 @@ def _process_one_shape(shape, idx, total, header, footer, out_dir, args, device)
         tensile_result = parse_tensile_csv(case_dir)
 
     bench_result = None
+    api_result = None
     if args.run or args.compare_only:
         # hipblaslt-bench expects BLAS col-major dims: m=N, n=M
         bench_result = run_hipblaslt_bench(
@@ -838,6 +902,14 @@ def _process_one_shape(shape, idx, total, header, footer, out_dir, args, device)
             trans_b=shape.get("trans_b", False),
             log_dir=out_dir, device=device, dtype=dtype,
         )
+        # API bench: same col-major dims, Tensile-aligned timing
+        if dtype == "bf16":
+            api_result = run_api_bench(
+                shape["N"], shape["M"], shape["K"],
+                trans_a=shape.get("trans_a", True),
+                trans_b=shape.get("trans_b", False),
+                device=device,
+            )
 
     row = {
         "model": shape["model"],
@@ -855,26 +927,37 @@ def _process_one_shape(shape, idx, total, header, footer, out_dir, args, device)
         "bench_time_us": bench_result["time_us"] if bench_result else None,
         "bench_kernel": bench_result["kernel_name"] if bench_result else None,
         "bench_cmd": bench_result.get("cmd") if bench_result else None,
+        "api_tflops": api_result["tflops"] if api_result else None,
+        "api_time_us": api_result["time_us"] if api_result else None,
+        "api_kernel": api_result["kernel_name"] if api_result else None,
     }
 
     _write_shape_report(row, out_dir / f"{sid}.report.md")
 
     t = row["tensile_tflops"]
     b = row["bench_tflops"]
+    a = row["api_tflops"]
     parts = []
     if t is not None:
         parts.append(f"Tensile={t:.1f}")
+    if a is not None:
+        parts.append(f"API={a:.1f}")
     if b is not None:
         parts.append(f"Bench={b:.1f}")
     ratio = ""
-    if t and b and b > 0:
+    if t and a and a > 0:
+        ratio = f"  (T/A={t/a:.0%})"
+    elif t and b and b > 0:
         ratio = f"  (T/B={t/b:.0%})"
     _thread_print(f"  >> {' | '.join(parts)}{ratio}")
 
     tw = row.get("tensile_winner")
+    ak = row.get("api_kernel")
     bk = row.get("bench_kernel")
     if tw:
         _thread_print(f"  >> Tensile kernel: {tw}")
+    if ak:
+        _thread_print(f"  >> API kernel:     {ak}")
     if bk:
         _thread_print(f"  >> Bench kernel:   {bk}")
 
@@ -883,25 +966,29 @@ def _process_one_shape(shape, idx, total, header, footer, out_dir, args, device)
 
 def print_report(results, dtype="bf16"):
     dtype_label = dtype.upper()
-    print(f"\n{'='*140}")
+    print(f"\n{'='*160}")
     print(f"COMPARISON REPORT: Tensile tuned {dtype_label} GEMM vs stock baseline")
-    print(f"{'='*140}")
+    print(f"{'='*160}")
     hdr = (f"{'Model':<18} {'Layer':<14} {'Phase':<6} {'MBS':>4} {'Trans':>5} "
            f"{'M':>6} {'N':>6} {'K':>6}  "
-           f"{'Tensile':>10} {'Bench':>10} {'T/B':>8}")
+           f"{'Tensile':>10} {'API':>10} {'Bench':>10} {'T/A':>8} {'T/B':>8}")
     print(hdr)
-    print("-" * 120)
+    print("-" * 140)
     for r in results:
         t = r["tensile_tflops"]
+        a = r.get("api_tflops")
         b = r["bench_tflops"]
         t_s = f"{t:.2f}" if t else "N/A"
+        a_s = f"{a:.2f}" if a else "N/A"
         b_s = f"{b:.2f}" if b else "N/A"
+        ta_ratio = f"{t/a:.2%}" if (t and a and a > 0) else "N/A"
         tb_ratio = f"{t/b:.2%}" if (t and b and b > 0) else "N/A"
         print(f"{r['model']:<18} {r['layer']:<14} {r.get('phase', 'fwd'):<6} {r['mbs']:>4} "
               f"{r.get('trans', 'TNN'):>5} "
               f"{r['M']:>6} {r['N']:>6} {r['K']:>6}  "
-              f"{t_s:>10} {b_s:>10} {tb_ratio:>8}")
-    print(f"{'='*120}")
+              f"{t_s:>10} {a_s:>10} {b_s:>10} {ta_ratio:>8} {tb_ratio:>8}")
+    print(f"{'='*140}")
+    print(f"  T/A = Tensile tuned / API bench (same-methodology gate metric)")
     print(f"  T/B = Tensile tuned / hipblaslt-bench stock")
 
 
@@ -910,6 +997,7 @@ def save_report_csv(results, path):
         return
     keys = ["model", "layer", "phase", "mbs", "trans", "M", "N", "K",
             "tensile_tflops", "tensile_time_us", "tensile_winner",
+            "api_tflops", "api_time_us", "api_kernel",
             "bench_tflops", "bench_time_us", "bench_kernel"]
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")

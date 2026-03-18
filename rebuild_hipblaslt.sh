@@ -108,20 +108,31 @@ approved, gated = [], []
 with open(csv_path) as f:
     for row in csv.DictReader(f):
         t = float(row.get("tensile_tflops") or 0)
+        a = float(row.get("api_tflops") or 0)
         b = float(row.get("bench_tflops") or 0)
         trans = row.get("trans", "TNN")
         shape_id = (f"{row['model']}_{row['layer']}_mbs{row['mbs']}"
                     f"_{row.get('phase','fwd')}_{trans}"
                     f"_M{row['M']}_N{row['N']}_K{row['K']}")
-        ratio = t / b if b > 0 else 0
+        # Prefer api_tflops (same methodology as Tensile) for gating;
+        # fall back to bench_tflops if api is unavailable
+        if a > 0:
+            ratio = t / a
+            tag = "T/A"
+        elif b > 0:
+            ratio = t / b
+            tag = "T/B"
+        else:
+            ratio = 0
+            tag = "N/A"
         if ratio >= threshold:
             approved.append(shape_id)
         else:
-            gated.append((shape_id, ratio))
+            gated.append((shape_id, ratio, tag))
 if gated:
     print(f"  [gate] {len(gated)} shape(s) gated (ratio < {threshold:.2f}):", file=sys.stderr)
-    for sid, r in gated:
-        print(f"         {sid}  T/B={r:.2%}", file=sys.stderr)
+    for sid, r, tag in gated:
+        print(f"         {sid}  {tag}={r:.2%}", file=sys.stderr)
 if approved:
     print(f"  [gate] {len(approved)} shape(s) approved", file=sys.stderr)
 for s in approved:

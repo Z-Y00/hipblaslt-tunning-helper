@@ -32,14 +32,20 @@
 
 struct GemmShape {
     const char* name;
-    int64_t m, n, k;       // col-major hipblaslt dims
+    int64_t m, n, k;
     hipblasOperation_t opA, opB;
-    double tensile_tflops;  // reference from tuning
-    double bench_tflops;    // reference from hipblaslt-bench
+    double tensile_tflops;
+    double bench_tflops;
 };
 
-static double run_gemm(hipblasLtHandle_t handle, const GemmShape& s,
-                       int warmup, int iters, bool verbose) {
+struct GemmResult {
+    double avg_us;
+    double avg_tflops;
+    std::string kernel_name;
+};
+
+static GemmResult run_gemm(hipblasLtHandle_t handle, const GemmShape& s,
+                           int warmup, int iters, bool verbose) {
     const int64_t m = s.m, n = s.n, k = s.k;
     const int64_t lda = (s.opA == HIPBLAS_OP_T) ? k : m;
     const int64_t ldb = (s.opB == HIPBLAS_OP_T) ? n : k;
@@ -53,7 +59,7 @@ static double run_gemm(hipblasLtHandle_t handle, const GemmShape& s,
     size_t bytesB = sizeB * sizeof(hip_bfloat16);
     size_t bytesC = sizeC * sizeof(hip_bfloat16);
     size_t bytesD = sizeD * sizeof(hip_bfloat16);
-    // Tensile init: A,B,C = random bf16 in [-3,3], D = zero, alpha=1, beta=0
+
     auto fill_random_bf16 = [](hip_bfloat16* host, size_t count, unsigned seed) {
         std::mt19937 rng(seed);
         for (size_t i = 0; i < count; i++)
@@ -100,7 +106,7 @@ static double run_gemm(hipblasLtHandle_t handle, const GemmShape& s,
 
     hipblasLtMatmulPreference_t pref;
     HIPBLASLT_CHECK(hipblasLtMatmulPreferenceCreate(&pref));
-    size_t maxWorkspace = 256 * 1024 * 1024;  // 256 MB
+    size_t maxWorkspace = 256 * 1024 * 1024;
     HIPBLASLT_CHECK(hipblasLtMatmulPreferenceSetAttribute(pref,
                     HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
                     &maxWorkspace, sizeof(maxWorkspace)));
@@ -113,7 +119,7 @@ static double run_gemm(hipblasLtHandle_t handle, const GemmShape& s,
                     requestCount, results.data(), &returnCount));
 
     if (returnCount == 0) {
-        fprintf(stderr, "  No algorithms found for %s!\n", s.name);
+        fprintf(stderr, "No algorithms found for %s!\n", s.name);
         hipFree(dA); hipFree(dB); hipFree(dC); hipFree(dD);
         hipblasLtMatmulDescDestroy(matmulDesc);
         hipblasLtMatrixLayoutDestroy(layoutA);
@@ -121,13 +127,9 @@ static double run_gemm(hipblasLtHandle_t handle, const GemmShape& s,
         hipblasLtMatrixLayoutDestroy(layoutC);
         hipblasLtMatrixLayoutDestroy(layoutD);
         hipblasLtMatmulPreferenceDestroy(pref);
-        return 0;
+        return {0, 0, ""};
     }
 
-    if (verbose)
-        printf("  Algorithms returned: %d\n", returnCount);
-
-    std::string solName = hipblaslt_ext::getSolutionNameFromAlgo(handle, results[0].algo);
     std::string kernName = hipblaslt_ext::getKernelNameFromAlgo(handle, results[0].algo);
 
     void* workspace = nullptr;
@@ -139,7 +141,6 @@ static double run_gemm(hipblasLtHandle_t handle, const GemmShape& s,
     hipStream_t stream;
     HIP_CHECK(hipStreamCreate(&stream));
 
-    // Warmup (Tensile: num-warmups=30)
     for (int i = 0; i < warmup; i++) {
         HIPBLASLT_CHECK(hipblasLtMatmul(handle, matmulDesc,
                         &alpha, dA, layoutA, dB, layoutB,
@@ -148,18 +149,13 @@ static double run_gemm(hipblasLtHandle_t handle, const GemmShape& s,
     }
     HIP_CHECK(hipStreamSynchronize(stream));
 
-    // Tensile-exact timing:
-    //   ONE event pair around all enqueues, total_time / N = avg per-enqueue
-    //   No per-call events, no rotating buffers (rotating-buffer-size=0)
-    const int enqueues_per_sync = iters;  // all enqueues in one batch
     double flops = 2.0 * m * n * k;
-
     hipEvent_t ev_start, ev_stop;
     HIP_CHECK(hipEventCreate(&ev_start));
     HIP_CHECK(hipEventCreate(&ev_stop));
 
     HIP_CHECK(hipEventRecord(ev_start, stream));
-    for (int j = 0; j < enqueues_per_sync; j++) {
+    for (int j = 0; j < iters; j++) {
         HIPBLASLT_CHECK(hipblasLtMatmul(handle, matmulDesc,
                         &alpha, dA, layoutA, dB, layoutB,
                         &beta, dC, layoutC, dD, layoutD,
@@ -171,12 +167,11 @@ static double run_gemm(hipblasLtHandle_t handle, const GemmShape& s,
     float total_ms = 0;
     HIP_CHECK(hipEventElapsedTime(&total_ms, ev_start, ev_stop));
     double total_us = total_ms * 1000.0;
-    double avg_us = total_us / enqueues_per_sync;
+    double avg_us = total_us / iters;
     double avg_tflops = flops / (avg_us * 1e6);
 
     HIP_CHECK(hipEventDestroy(ev_start));
     HIP_CHECK(hipEventDestroy(ev_stop));
-
     HIP_CHECK(hipStreamDestroy(stream));
     if (workspace) hipFree(workspace);
     hipFree(dA); hipFree(dB); hipFree(dC); hipFree(dD);
@@ -187,65 +182,99 @@ static double run_gemm(hipblasLtHandle_t handle, const GemmShape& s,
     hipblasLtMatrixLayoutDestroy(layoutD);
     hipblasLtMatmulPreferenceDestroy(pref);
 
-    printf("  %-36s m=%5ld n=%5ld k=%5ld | avg %7.1f us  %7.1f TF | Tensile=%7.1f  Bench=%7.1f\n",
-           s.name, (long)m, (long)n, (long)k,
-           avg_us, avg_tflops,
-           s.tensile_tflops, s.bench_tflops);
-    printf("    kernel: %s\n", kernName.c_str());
+    return {avg_us, avg_tflops, kernName};
+}
 
-    return avg_tflops;
+static void usage() {
+    fprintf(stderr,
+        "Usage: test_hipblaslt_api [options]\n"
+        "  Single-shape mode (for pipeline integration):\n"
+        "    -m M -n N -k K [--transA T|N] [--transB T|N]\n"
+        "  Multi-shape mode (hardcoded demo shapes, no -m/-n/-k)\n"
+        "\n"
+        "  --device D     GPU device index (default 0)\n"
+        "  --warmup W     Warmup iterations (default 30)\n"
+        "  --iters I      Timed iterations (default 50)\n"
+        "  --csv          Machine-readable output: avg_us,tflops,kernel_name\n"
+    );
 }
 
 int main(int argc, char** argv) {
-    int device = 0;
-    int warmup = 50;
-    int iters  = 200;
+    int device = 0, warmup = 30, iters = 50;
+    int64_t cli_m = 0, cli_n = 0, cli_k = 0;
+    char cli_transA = 'T', cli_transB = 'N';
+    bool csv_mode = false;
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--device") == 0 && i + 1 < argc)
-            device = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--warmup") == 0 && i + 1 < argc)
-            warmup = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--iters") == 0 && i + 1 < argc)
-            iters = atoi(argv[++i]);
+        if (strcmp(argv[i], "--device") == 0 && i+1 < argc) device = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--warmup") == 0 && i+1 < argc) warmup = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--iters") == 0 && i+1 < argc) iters = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-m") == 0 && i+1 < argc) cli_m = atoll(argv[++i]);
+        else if (strcmp(argv[i], "-n") == 0 && i+1 < argc) cli_n = atoll(argv[++i]);
+        else if (strcmp(argv[i], "-k") == 0 && i+1 < argc) cli_k = atoll(argv[++i]);
+        else if (strcmp(argv[i], "--transA") == 0 && i+1 < argc) cli_transA = argv[++i][0];
+        else if (strcmp(argv[i], "--transB") == 0 && i+1 < argc) cli_transB = argv[++i][0];
+        else if (strcmp(argv[i], "--csv") == 0) csv_mode = true;
+        else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            usage(); return 0;
+        }
     }
 
     HIP_CHECK(hipSetDevice(device));
-
-    hipDeviceProp_t props;
-    HIP_CHECK(hipGetDeviceProperties(&props, device));
-    printf("Device %d: %s\n", device, props.name);
-    printf("Warmup: %d, Iters: %d\n\n", warmup, iters);
-
     hipblasLtHandle_t handle;
     HIPBLASLT_CHECK(hipblasLtCreate(&handle));
 
-    // All shapes from tuning: hipblaslt col-major (m=N_row, n=M_row, k=K)
-    // transA=T, transB=N for all TNN shapes
-    GemmShape shapes[] = {
-        {"attn_k(M8192_N1024_K4096)",
-         1024, 8192, 4096, HIPBLAS_OP_T, HIPBLAS_OP_N, 1223.23, 702.51},
-        {"attn_q+out(M8192_N4096_K4096)",
-         4096, 8192, 4096, HIPBLAS_OP_T, HIPBLAS_OP_N, 1570.28, 1570.28},
-        {"attn_qkv(M8192_N6144_K4096)",
-         6144, 8192, 4096, HIPBLAS_OP_T, HIPBLAS_OP_N, 1603.70, 0},
-        {"mlp_gate(M8192_N14336_K4096)",
-         14336, 8192, 4096, HIPBLAS_OP_T, HIPBLAS_OP_N, 1733.63, 1537.05},
-        {"mlp_gate_up(M8192_N28672_K4096)",
-         28672, 8192, 4096, HIPBLAS_OP_T, HIPBLAS_OP_N, 1619.47, 1480.34},
-        {"mlp_down(M8192_N4096_K14336)",
-         4096, 8192, 14336, HIPBLAS_OP_T, HIPBLAS_OP_N, 1797.47, 1629.03},
-    };
+    bool single_shape = (cli_m > 0 && cli_n > 0 && cli_k > 0);
 
-    printf("  Tensile-exact: %d warmup, %d enqueues (1 event pair), rotating=0, use-gpu-timer=True\n\n",
-           warmup, iters);
-    printf("  %-36s %5s %5s %5s   %18s   %10s %10s\n",
-           "Shape", "m", "n", "k",
-           "avg us / TF", "Tensile", "Bench");
-    printf("%s\n", std::string(120, '-').c_str());
+    if (single_shape) {
+        hipblasOperation_t opA = (cli_transA == 'T') ? HIPBLAS_OP_T : HIPBLAS_OP_N;
+        hipblasOperation_t opB = (cli_transB == 'T') ? HIPBLAS_OP_T : HIPBLAS_OP_N;
+        GemmShape s = {"cli", cli_m, cli_n, cli_k, opA, opB, 0, 0};
+        auto r = run_gemm(handle, s, warmup, iters, !csv_mode);
+        if (csv_mode) {
+            printf("%.3f,%.4f,%s\n", r.avg_us, r.avg_tflops, r.kernel_name.c_str());
+        } else {
+            printf("m=%ld n=%ld k=%ld transA=%c transB=%c | avg %.1f us  %.1f TFLOPS\n",
+                   (long)cli_m, (long)cli_n, (long)cli_k, cli_transA, cli_transB,
+                   r.avg_us, r.avg_tflops);
+            printf("kernel: %s\n", r.kernel_name.c_str());
+        }
+    } else {
+        hipDeviceProp_t props;
+        HIP_CHECK(hipGetDeviceProperties(&props, device));
+        printf("Device %d: %s\n", device, props.name);
+        printf("Warmup: %d, Iters: %d\n\n", warmup, iters);
 
-    for (auto& s : shapes)
-        run_gemm(handle, s, warmup, iters, false);
+        GemmShape shapes[] = {
+            {"attn_k(M8192_N1024_K4096)",
+             1024, 8192, 4096, HIPBLAS_OP_T, HIPBLAS_OP_N, 1223.23, 702.51},
+            {"attn_q+out(M8192_N4096_K4096)",
+             4096, 8192, 4096, HIPBLAS_OP_T, HIPBLAS_OP_N, 1570.28, 1570.28},
+            {"attn_qkv(M8192_N6144_K4096)",
+             6144, 8192, 4096, HIPBLAS_OP_T, HIPBLAS_OP_N, 1603.70, 0},
+            {"mlp_gate(M8192_N14336_K4096)",
+             14336, 8192, 4096, HIPBLAS_OP_T, HIPBLAS_OP_N, 1733.63, 1537.05},
+            {"mlp_gate_up(M8192_N28672_K4096)",
+             28672, 8192, 4096, HIPBLAS_OP_T, HIPBLAS_OP_N, 1619.47, 1480.34},
+            {"mlp_down(M8192_N4096_K14336)",
+             4096, 8192, 14336, HIPBLAS_OP_T, HIPBLAS_OP_N, 1797.47, 1629.03},
+        };
+
+        printf("  Tensile-exact: %d warmup, %d enqueues (1 event pair), rotating=0\n\n",
+               warmup, iters);
+        printf("  %-36s %5s %5s %5s   %18s   %10s %10s\n",
+               "Shape", "m", "n", "k", "avg us / TF", "Tensile", "Bench");
+        printf("%s\n", std::string(120, '-').c_str());
+
+        for (auto& s : shapes) {
+            auto r = run_gemm(handle, s, warmup, iters, false);
+            printf("  %-36s m=%5ld n=%5ld k=%5ld | avg %7.1f us  %7.1f TF | "
+                   "Tensile=%7.1f  Bench=%7.1f\n",
+                   s.name, (long)s.m, (long)s.n, (long)s.k,
+                   r.avg_us, r.avg_tflops, s.tensile_tflops, s.bench_tflops);
+            printf("    kernel: %s\n", r.kernel_name.c_str());
+        }
+    }
 
     HIPBLASLT_CHECK(hipblasLtDestroy(handle));
     return 0;
