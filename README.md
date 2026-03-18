@@ -10,18 +10,38 @@ dense LLM architectures (Llama-2, Llama-3.1, Qwen-2.5, Mistral-7B).
 
 ## Setup
 
+### Quick clone (~10 MB, recommended)
+
+Clone without submodules first, then selectively init only what's needed:
+
 ```bash
-git clone --recursive https://github.com/Z-Y00/hipblaslt-tunning-helper.git
+git clone https://github.com/Z-Y00/hipblaslt-tunning-helper.git
 cd hipblaslt-tunning-helper
 
-# The origami submodule uses sparse checkout (only shared/origami/ from rocm-libraries).
-# After clone, enable sparse checkout for it:
-cd origami
-git sparse-checkout init --cone
-git sparse-checkout set shared/origami
-cd ..
+# Init lightweight submodules only (turbo ~3 MB, origami ~4 MB)
+git submodule update --init turbo
 
-# Build TensileLite client and install Origami
+# origami: sparse checkout of shared/origami/ from rocm-libraries
+git submodule update --init origami
+cd origami && git sparse-checkout init --cone && git sparse-checkout set shared/origami && cd ..
+```
+
+The `hipblaslt` submodule (7 GB) is **not needed** for normal use — `rebuild_hipblaslt.sh`
+and `init_build.sh` clone `rocm-libraries` into `tmp_rebuild/` and apply patches from
+`patches/` automatically. Only init it if you need to develop patches against hipBLASLt:
+
+```bash
+# Optional: only if developing hipBLASLt patches
+git submodule update --init hipblaslt
+```
+
+### Build
+
+```bash
+# Clone rocm-libraries, build hipBLASLt, apply patches
+./rebuild_hipblaslt.sh
+
+# Build TensileLite client (applies patches), install Origami
 ./init_build.sh
 ```
 
@@ -53,25 +73,28 @@ python3 run_shapes.py --run --origami-top-n 30
 
 ## Full tuning run (nohup)
 
-Use `run_all.sh` for long-running tuning jobs.  It runs under `nohup` so
+Use `launch_tuning.sh` for long-running tuning jobs.  It runs under `nohup` so
 it survives terminal disconnects, and saves output to a timestamped log.
 
 ```bash
 # All models, fwd + bwd, 8 GPUs, origami pruning
-./run_all.sh
+./launch_tuning.sh
 
 # Filter to one model
-./run_all.sh --filter Llama-3.1-8B
+./launch_tuning.sh --filter Llama-3.1-8B
 
 # Forward only
-./run_all.sh --fwd-only
+./launch_tuning.sh --fwd-only
 
 # Combine options
-./run_all.sh --filter Llama-3.1-8B --fwd-only --max-shapes 4
+./launch_tuning.sh --filter Llama-3.1-8B --fwd-only --max-shapes 4
 
 # Follow the log
-tail -f tunning_results/run_all_*.log
+tail -f tunning_results/launch_tuning_*.log
 ```
+
+Tuning supports **resume**: if a shape already has a valid `.report.md`, it is
+skipped automatically.  Use `--force` to re-tune everything.
 
 ## Shapes
 
@@ -91,12 +114,18 @@ Batch sizes (MBS): 1, 2, 4
 
 ```
 ├── README.md
-├── config.py                  # Imports from turbo submodule + shape generation
+├── config.py                  # Model definitions + shape generation
 ├── run_shapes.py              # Main tuning + comparison script
+├── launch_tuning.sh           # nohup wrapper for multi-GPU tuning
+├── init_build.sh              # Build TensileLite client, apply patches, install Origami
+├── rebuild_hipblaslt.sh       # Clone rocm-libraries + build hipBLASLt from source
+├── test_hipblaslt_api.cpp     # API bench driver (Tensile-aligned timing)
+├── patches/                   # Tensile patches (applied by init_build.sh)
 ├── templates/
-│   └── bf16_gemm_gfx950.yaml  # Tensile YAML template (BF16, gfx950)
+│   ├── bf16_gemm_gfx950.yaml  # Tensile YAML template (BF16, gfx950)
+│   └── f8_gemm_gfx950.yaml   # Tensile YAML template (FP8, gfx950)
 ├── turbo/                     # Submodule: AMD-AGI/Primus-Turbo (benchmark configs)
-├── hipblaslt/                 # Submodule: Z-Y00/hipBLASLt @ cosmo-dev (patched TensileLite)
+├── hipblaslt/                 # Submodule: Z-Y00/hipBLASLt (optional, for patch dev)
 └── origami/                   # Submodule: ROCm/rocm-libraries (sparse: shared/origami only)
 ```
 
@@ -147,6 +176,8 @@ For each shape, the script:
 ## Configuration
 
 - **Template**: Override with `--template path/to/custom.yaml`
-- **TensileLite path**: Defaults to `hipblaslt/tensilelite` submodule.
-  Override with `TENSILE_WD` environment variable.
+- **TensileLite path**: Prefers `tmp_rebuild/rocm-libraries/.../tensilelite` (build-tree),
+  falls back to `hipblaslt/tensilelite` submodule. Override with `TENSILE_WD` env var.
 - **Output**: Set `--output-dir` (default: `tunning_results/`)
+- **Cleanup**: Post-tuning cleanup deletes `.o`/`.s`/`.co`/`.hsaco` and compresses each
+  shape dir to `.tar.zst` (~2 MB/shape vs ~1.9 GB). Disable with `--no-cleanup`.
