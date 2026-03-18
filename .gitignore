@@ -5,6 +5,9 @@ __pycache__/
 *.co
 .rocprofv3/
 a.out
+test_hipblaslt_api
+tmp_rebuild/
+tmp_benchmark/
 .git-cache/
 smci*
 *.out

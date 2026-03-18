@@ -27,6 +27,11 @@ The other submodules are **not needed** for normal use:
 - **`hipblaslt`** (7 GB) — `rebuild_hipblaslt.sh` clones `rocm-libraries` into
   `tmp_rebuild/` and `init_build.sh` applies patches from `patches/` automatically
 
+> **Warning:** Do NOT run `git sparse-checkout` in the main repo directory.
+> Sparse checkout is used only inside `tmp_rebuild/rocm-libraries` (handled
+> automatically by `init_build.sh`). Running it on the main repo will hide
+> tracked files like `templates/`, `patches/`, etc.
+
 ### Build
 
 ```bash

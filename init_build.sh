@@ -122,6 +122,14 @@ pip3 install invoke
 invoke build-client
 cd "$SCRIPT_DIR"
 
+echo "=== Building API bench driver ==="
+if [ -f "$SCRIPT_DIR/test_hipblaslt_api.cpp" ]; then
+  hipcc "$SCRIPT_DIR/test_hipblaslt_api.cpp" -lhipblaslt -o "$SCRIPT_DIR/test_hipblaslt_api"
+  echo "  Built: $SCRIPT_DIR/test_hipblaslt_api"
+else
+  echo "  WARNING: test_hipblaslt_api.cpp not found, skipping"
+fi
+
 echo "=== Installing Origami ==="
 _ORIGAMI_BUILD="$MONO_REPO/shared/origami/python"
 _ORIGAMI_SUB="$SCRIPT_DIR/origami/shared/origami/python"
