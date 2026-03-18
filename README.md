@@ -18,30 +18,22 @@ Clone without submodules first, then selectively init only what's needed:
 git clone https://github.com/Z-Y00/hipblaslt-tunning-helper.git
 cd hipblaslt-tunning-helper
 
-# Init lightweight submodules only (turbo ~3 MB, origami ~4 MB)
+# Init turbo submodule (~3 MB)
 git submodule update --init turbo
-
-# origami: sparse checkout of shared/origami/ from rocm-libraries
-git submodule update --init origami
-cd origami && git sparse-checkout init --cone && git sparse-checkout set shared/origami && cd ..
 ```
 
-The `hipblaslt` submodule (7 GB) is **not needed** for normal use — `rebuild_hipblaslt.sh`
-and `init_build.sh` clone `rocm-libraries` into `tmp_rebuild/` and apply patches from
-`patches/` automatically. Only init it if you need to develop patches against hipBLASLt:
-
-```bash
-# Optional: only if developing hipBLASLt patches
-git submodule update --init hipblaslt
-```
+The other submodules are **not needed** for normal use:
+- **`origami`** — installed from `tmp_rebuild/rocm-libraries` by `init_build.sh`
+- **`hipblaslt`** (7 GB) — `rebuild_hipblaslt.sh` clones `rocm-libraries` into
+  `tmp_rebuild/` and `init_build.sh` applies patches from `patches/` automatically
 
 ### Build
 
 ```bash
-# Clone rocm-libraries, build hipBLASLt, apply patches
+# Clone rocm-libraries, build hipBLASLt (creates tmp_rebuild/)
 ./rebuild_hipblaslt.sh
 
-# Build TensileLite client (applies patches), install Origami
+# Apply Tensile patches, build TensileLite client, install Origami
 ./init_build.sh
 ```
 

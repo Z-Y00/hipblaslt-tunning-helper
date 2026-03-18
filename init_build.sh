@@ -83,6 +83,14 @@ invoke build-client
 cd "$SCRIPT_DIR"
 
 echo "=== Installing Origami ==="
-pip3 install origami/shared/origami/python/
+_ORIGAMI_BUILD="$SCRIPT_DIR/tmp_rebuild/rocm-libraries/shared/origami/python"
+_ORIGAMI_SUB="$SCRIPT_DIR/origami/shared/origami/python"
+if [ -d "$_ORIGAMI_BUILD" ]; then
+  pip3 install "$_ORIGAMI_BUILD"
+elif [ -d "$_ORIGAMI_SUB" ]; then
+  pip3 install "$_ORIGAMI_SUB"
+else
+  echo "  WARNING: origami not found (run rebuild_hipblaslt.sh first or init origami submodule)"
+fi
 
 echo "=== Done ==="
