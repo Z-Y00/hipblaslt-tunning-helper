@@ -1,0 +1,367 @@
+# hipBLASLt Tuning Knowledge Base
+
+## Re-running a Specific Tensile Solution from Tuning Results
+
+After a Tensile tuning run completes (via `run_shapes.py`), you can re-benchmark
+individual solutions from the result library without re-running the full tuning.
+
+### Locate the Client and Config
+
+Each tuned shape produces a directory under `tunning_results/<dtype>/<shape_id>/`.
+The key files are:
+
+```
+tunning_results/bf16/<shape_id>/
+├── 1_BenchmarkProblems/
+│   └── Cijk_..._00/
+│       ├── 00_Final/
+│       │   └── source/
+│       │       ├── ClientParameters.ini   # <-- benchmark config
+│       │       └── library/
+│       │           └── TensileLibrary_gfx950.co  # <-- compiled kernels
+│       └── Data/
+│           └── 00_Final.csv
+└── 2_BenchmarkData/
+    └── Cijk_..._CSVWinner.csv   # <-- winner summary
+```
+
+The Tensile client binary is at:
+```
+tmp_rebuild/rocm-libraries/projects/hipblaslt/tensilelite/build_tmp/tensilelite/client/tensilelite-client
+```
+
+### Find the Winner Solution Index
+
+```bash
+python3 -c "
+import csv
+with open('tunning_results/bf16/<shape_id>/2_BenchmarkData/Cijk_*_CSVWinner.csv') as f:
+    for i, row in enumerate(csv.DictReader(f)):
+        wg = float(row.get(' WinnerGFlops') or row.get('WinnerGFlops') or 0)
+        wi = row.get(' WinnerIdx') or row.get('WinnerIdx') or '?'
+        wn = (row.get(' WinnerName') or row.get('WinnerName') or '').strip()
+        print(f'Row {i}: idx={wi}  {wg/1e6:.1f} TFLOPS  {wn[-80:]}')
+"
+```
+
+### Re-benchmark a Specific Solution
+
+Use `--solution-start-idx` and `--num-solutions 1` to run only the desired solution:
+
+```bash
+CLIENT="tmp_rebuild/rocm-libraries/projects/hipblaslt/tensilelite/build_tmp/tensilelite/client/tensilelite-client"
+CONFIG="tunning_results/bf16/<shape_id>/1_BenchmarkProblems/Cijk_..._00/00_Final/source/ClientParameters.ini"
+
+# Run only solution 911 (example), 10 benchmark iterations
+HIP_VISIBLE_DEVICES=4 $CLIENT \
+    --config-file "$CONFIG" \
+    --solution-start-idx 911 \
+    --num-solutions 1 \
+    --num-benchmarks 10
+```
+
+### Run the Stock Library Baseline
+
+Use `--best-solution` to benchmark the library's pre-selected best solution (solution 0):
+
+```bash
+HIP_VISIBLE_DEVICES=4 $CLIENT \
+    --config-file "$CONFIG" \
+    --best-solution \
+    --num-benchmarks 10
+```
+
+### Control Enqueues-per-Sync
+
+By default, the config uses `num-enqueues-per-sync=50` (50 kernel launches batched
+before measuring). You can override:
+
+```bash
+# Batch mode (original tuning behavior)
+--num-enqueues-per-sync 50 --num-syncs-per-benchmark 1
+
+# Per-call mode (closer to hipblaslt-bench behavior)
+--num-enqueues-per-sync 1 --num-syncs-per-benchmark 50
+```
+
+**Finding:** Both modes produce nearly identical results (~556 µs for this kernel).
+The ~12% gap between Tensile client and hipblaslt-bench is NOT caused by batching.
+
+### Compare with hipblaslt-bench
+
+```bash
+HIP_VISIBLE_DEVICES=4 /opt/rocm/bin/hipblaslt-bench \
+    -m 14336 -n 8192 -k 4096 \
+    --precision bf16_r --compute_type f32_r \
+    --transA T --transB N \
+    -i 50 -j 30 \
+    --rotating 0 \
+    --use_gpu_timer \
+    --print_kernel_info
+```
+
+### Output Format
+
+The Tensile client outputs CSV rows with these fields:
+```
+run, problem-progress, solution-progress, operation, problem-sizes, bias-type,
+factor-dim, activation-type, solution, validation, time-us, gflops, ...
+```
+
+Extract time and TFLOPS from `PASSED` lines:
+```bash
+... | grep PASSED | python3 -c "
+import sys
+for line in sys.stdin:
+    parts = line.split('PASSED,')
+    after = parts[1].split(',')
+    time_us, gflops = float(after[0]), float(after[1])
+    print(f'  {time_us:.1f} us  {gflops/1e6:.1f} TFLOPS')
+"
+```
+
+## Tensile Client Timing Internals (Source-Verified)
+
+Source: `hipblaslt/tensilelite/client/src/BenchmarkTimer.cpp` and `client/main.cpp`
+
+### Benchmark Parameters (from ClientParameters.ini)
+
+```
+num-enqueues-per-sync=50     # 50 kernel launches per sync batch
+num-syncs-per-benchmark=1    # 1 batch per benchmark run
+use-gpu-timer=True           # GPU event timing (not host clock)
+num-warmups=30               # warmups before timed run
+icache-flush-args=False      # no icache flush (flushTimeUs=0)
+rotating-buffer-size=0       # NO rotating buffers in Tensile!
+```
+
+### Exact Timing Flow
+
+1. **`preEnqueues()`**: Creates ONE event pair, records start:
+   ```cpp
+   hipEventCreate(&start);
+   hipEventCreate(&stop);
+   hipEventRecord(start, stream);
+   ```
+
+2. **Inner loop** (50 iterations): Direct kernel launch, NO per-kernel events:
+   ```cpp
+   for (int j = 0; j < 50; j++) {
+       adapter.launchKernels(kernels[kIdx], stream, nullptr, nullptr);
+       // → calls hipExtModuleLaunchKernel() directly
+       // → nullptr events = NO hipEventRecord per kernel
+   }
+   ```
+
+3. **`postEnqueues()`**: Records stop + synchronizes:
+   ```cpp
+   hipEventRecord(stop, stream);
+   hipEventSynchronize(stop);
+   ```
+
+4. **`validateEnqueues()`**: Reads the single event pair:
+   ```cpp
+   hipEventElapsedTime(&eventMs, start, stop);
+   // totalTime = eventMs (includes all 50 kernel executions + inter-kernel gaps)
+   ```
+
+5. **`postSolution()`**: Computes average:
+   ```cpp
+   timePerEnqueue_us = totalTime_us / numEnqueues - flushTimeUs;
+   // flushTimeUs=0 when icache-flush=False
+   gflops = flopCount / timePerEnqueue_us / 1000.0;
+   ```
+
+### Key Properties
+
+- **Single event pair** around all 50 enqueues (NOT per-call events)
+- **Zero per-kernel overhead**: `nullptr` events, no validation between calls
+- **Direct `hipExtModuleLaunchKernel`**: Bypasses hipBLASLt dispatch layer entirely
+- **Average (total/N)**: NOT best-of-N or median — just total time / 50
+- **Inter-kernel gaps included**: The single event pair captures wall-clock GPU time
+  including any micro-gaps between consecutive kernel executions
+- **No rotating buffers**: `rotating-buffer-size=0` in all tuning configs
+
+### Why hipBLASLt API Calls Measure Differently
+
+A C++ driver using `hipblasLtMatmul()` with per-call events will report ~10-15%
+higher TFLOPS than Tensile because:
+
+1. **Best-of-N vs Average**: Taking best of N individual measurements always gives
+   lower time than total/N average
+2. **Per-call events exclude inter-kernel gaps**: Individual event pairs measure
+   only kernel execution time, while Tensile's single pair includes dispatch gaps
+3. **`rotating-buffer-size=0` in Tensile** means warm L2 cache — but per-call
+   events in the driver can still show different variance characteristics
+
+To reproduce Tensile's numbers exactly: use ONE event pair around all N enqueues,
+divide total elapsed time by N, use `hipExtModuleLaunchKernel` directly (not
+`hipblasLtMatmul`), and use `rotating-buffer-size=0`.
+
+## Measurement Bias: Tensile Client vs hipblaslt-bench
+
+### Key Finding
+
+There is a consistent ~12% measurement gap between the Tensile client and
+hipblaslt-bench when benchmarking the **same kernel on the same idle GPU**:
+
+| Tool                         | Time (µs) | TFLOPS | Notes                    |
+|------------------------------|----------:|-------:|--------------------------|
+| Tensile client (tuning .co)  |     556   |  1730  | JIT-compiled kernel      |
+| hipblaslt-bench (installed)  |     624   |  1538  | AOT-compiled, via lib    |
+
+### Root Cause
+
+The gap is **not** caused by:
+- Batching (50 vs 1 enqueue/sync) — tested, identical results
+- GPU contention — tested on idle GPU
+- Additional kernel launches per iteration — confirmed via `rocprofv3`
+
+The gap **is** caused by:
+- Different compiled kernel binaries (the installed .co has differently parameterized
+  variants even for the same tile shape: different NT, NEPBS, SPO, SSO, SKXCCM values)
+- Tensile uses direct `hipExtModuleLaunchKernel` while hipblaslt-bench uses the
+  `hipblasLtMatmul` API with its dispatch overhead
+
+### Implication for Gate Logic
+
+The gate in `rebuild_hipblaslt.sh` compares `tensile_tflops / bench_tflops`.
+Due to the ~12% tool bias, this ratio is always inflated — a kernel with ZERO
+actual improvement will show T/B ≈ 1.12.
+
+## GPU Contention Warning
+
+Always verify GPUs are idle before benchmarking:
+
+```bash
+rocm-smi --showuse
+```
+
+GPUs at 99% usage will produce dramatically worse results (e.g., 1026 TFLOPS
+instead of 1730 TFLOPS for the same kernel). Use `HIP_VISIBLE_DEVICES=<idle_gpu>`
+to target an idle GPU.
+
+## Verifying Which Kernel hipblaslt-bench Dispatches
+
+Use `rocprofv3 --kernel-trace` to see the exact kernel binary dispatched:
+
+```bash
+HIP_VISIBLE_DEVICES=4 rocprofv3 --kernel-trace -d /tmp/bench_trace -- \
+    /opt/rocm/bin/hipblaslt-bench -m 14336 -n 8192 -k 4096 \
+    --precision bf16_r --compute_type f32_r --transA T --transB N -i 4 -j 2
+```
+
+Then parse the SQLite database:
+```python
+import sqlite3, os
+db_dir = "/tmp/bench_trace"
+for root, dirs, files in os.walk(db_dir):
+    for f in files:
+        if f.endswith(".db"):
+            db_path = os.path.join(root, f)
+            break
+
+conn = sqlite3.connect(db_path)
+tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+# Find the guid from table names (format: rocpd_kernel_dispatch_<guid>)
+for t in tables:
+    if "kernel_dispatch" in t[0]:
+        dispatch_table = t[0]
+        guid = t[0].replace("rocpd_kernel_dispatch_", "")
+    if "kernel_symbol" in t[0]:
+        symbol_table = t[0]
+
+knames = {}
+for row in conn.execute(f"SELECT id, kernel_name FROM {symbol_table}"):
+    knames[row[0]] = row[1]
+
+for kid, start, end in conn.execute(
+    f"SELECT kernel_id, start, end FROM {dispatch_table} ORDER BY start"
+):
+    name = knames.get(kid, "?")
+    dur_us = (end - start) / 1000
+    tag = "GEMM" if "Cijk" in name else "fill" if "fill" in name else "other"
+    print(f"{tag:6s} dur={dur_us:8.1f} us  {name[:120]}")
+```
+
+## Inspecting Kernel Symbols in Bundled .co Files
+
+The installed `.co` files are bundled code objects. To inspect kernel symbols:
+
+```bash
+# Extract the gfx950 ELF from the bundle
+/opt/rocm/llvm/bin/clang-offload-bundler --unbundle \
+    -type=o \
+    -input=/opt/rocm/lib/hipblaslt/library/TensileLibrary_BB_BB_HA_Bias_SAV_UA_Type_BB_HPA_Contraction_l_Alik_Bljk_Cijk_Dijk_gfx950.co \
+    -output=/tmp/extracted.elf \
+    -targets=hipv4-amdgcn-amd-amdhsa--gfx950
+
+# List kernel symbols
+/opt/rocm/llvm/bin/llvm-readelf -s /tmp/extracted.elf | grep "Cijk.*MT256x256"
+
+# Search for specific kernel parameters
+strings -n 50 /tmp/extracted.elf | grep "CMS.*SK3"
+```
+
+Note: `strings` on the raw bundled `.co` will fragment long symbol names.
+Always extract first with `clang-offload-bundler --unbundle`.
+
+## Reproducing Tensile TFLOPS via hipBLASLt API (test_hipblaslt_api.cpp)
+
+### Critical: Data Initialization Must Match
+
+Tensile initializes matrices with **small random integers** cast to BFloat16:
+
+```cpp
+// From tensilelite/client/include/DataInitialization.hpp
+inline BFloat16 getValue<BFloat16, InitMode::Random>() {
+    return static_cast<BFloat16>((tl_rand() % 7) - 3);  // [-3, 3]
+}
+```
+
+Using constant data (e.g., `hipMemset(ptr, 0x3f, size)`) gives **10-15% inflated
+TFLOPS** because the GPU can exploit cache/compression optimizations on uniform data.
+
+Tensile init settings (from `ClientParameters.ini`):
+```
+init-a=Random    # bf16 integers in [-3, 3]
+init-b=Random    # bf16 integers in [-3, 3]
+init-c=Random    # bf16 integers in [-3, 3]
+init-d=Zero      # all zeros
+init-alpha=One   # 1.0f
+init-beta=Zero   # 0.0f
+```
+
+### Matching Tensile Timing Exactly
+
+To reproduce Tensile's reported TFLOPS through the hipBLASLt API:
+
+1. **Random data init**: Fill A, B, C with random bf16 in [-3, 3], D with zeros
+2. **Single event pair**: `hipEventRecord(start)` before all enqueues,
+   `hipEventRecord(stop)` after all enqueues — NOT per-call events
+3. **Average timing**: `total_time / num_enqueues` — NOT best-of-N
+4. **No rotating buffers**: `rotating-buffer-size=0`
+5. **30 warmups, 50 timed enqueues**
+
+### Results (API vs Tensile vs hipblaslt-bench)
+
+With all parameters aligned, the API driver matches Tensile within 1-2%:
+
+| Shape              | API TF | Tensile TF | API/T | Bench TF | API/B |
+|--------------------|-------:|----------:|------:|--------:|------:|
+| attn_q+out 4096x   | 1546   |     1570  | 0.98x |    1570 | 0.98x |
+| attn_qkv 6144x     | 1617   |     1604  | 1.01x |       — |     — |
+| mlp_gate 14336x    | 1722   |     1734  | 0.99x |    1537 | 1.12x |
+| mlp_gate_up 28672x | 1631   |     1620  | 1.01x |    1480 | 1.10x |
+| mlp_down 4096x14k  | 1783   |     1798  | 0.99x |    1629 | 1.09x |
+
+**Conclusion**: The installed tuned kernels deliver the Tensile-reported performance
+when called through `hipblasLtMatmul`. The ~10% gap vs `hipblaslt-bench` comes from
+`hipblaslt-bench`'s use of rotating buffers (cold L2 cache), not from kernel quality.
+
+### Why attn_k (M=1024) Is an Outlier
+
+The smallest shape `attn_k` (M8192_N1024_K4096) shows 785 TF via API vs 1223 TF
+from Tensile. This is likely due to the hipBLASLt heuristic selecting a different
+(suboptimal) kernel than Tensile's tuned winner for this shape, or the AOT-compiled
+variant behaving differently at this small tile occupancy.

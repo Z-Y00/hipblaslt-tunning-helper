@@ -4,10 +4,10 @@ TestParameters:
 GlobalParameters:
   SkipSlowSolutionRatio: 0.5
   NumElementsToValidate: 128 # skip full validation for fast tuning
-  NumWarmups: 20 # Lorri: get the latency stable
+  NumWarmups: 30
   NumBenchmarks: 1
   SyncsPerBenchmark: 1
-  EnqueuesPerSync: 30 # Lorri: set higher iters for avg
+  EnqueuesPerSync: 50
   CSVExportWinner: 1 # Lorri: save the winner
   CSVMergeSameProblemID: 1
   Device: 0 # Lorri: must do everything on the same GPU, avoid GPU 2 GPU difference
@@ -54,6 +54,8 @@ BenchmarkProblems:
       UseBeta: True
       Batched: True
       UseBias:       1
+      BiasDataTypeList: ['S','B'] # Lorri: f32_r and bf16_r for bias type, more robust matching
+      # BiasSrc: # Lorri: see hipblaslt/tensilelite/Tensile/Utilities/tensile_generator/tensile_config_generator.py
       Activation:    True
       ActivationType: hipblaslt_all
       UseScaleAlphaVec: 1
@@ -106,8 +108,7 @@ BenchmarkProblems:
           - Exact: [512,   5120, 1, 1536] 
           - Exact: [512,   5120, 1, 1536] 
           - Exact: [512,   5120, 1, 1536] 
-
-        - BiasTypeArgs: ['s']
+        - BiasTypeArgs: ['S','B'] # Lorri: f32_r and bf16_r for bias type, more robust matching
         - ActivationArgs:
           - [Enum: none]
 LibraryLogic: # Lorri, see hipblaslt/tensilelite/Tensile/Tests/common/gemm/gfx950/xfp32.yaml

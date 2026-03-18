@@ -63,11 +63,13 @@ _BENCH_PRECISION = {
 
 _FP8_DTYPES = {"f8", "f8b8"}
 
-# Tensile working directory — defaults to the hipblaslt submodule's tensilelite
-TENSILE_WD = Path(os.environ.get(
-    "TENSILE_WD",
-    str(WORKSPACE / "hipblaslt" / "tensilelite"),
-))
+# Tensile working directory — prefer the build-tree Tensile (same version as
+# TensileCreateLibrary used during hipBLASLt build) so that tuned solutions
+# have compatible parameters.  Falls back to the local submodule.
+_BUILD_TENSILE = WORKSPACE / "tmp_rebuild" / "rocm-libraries" / "projects" / "hipblaslt" / "tensilelite"
+_LOCAL_TENSILE = WORKSPACE / "hipblaslt" / "tensilelite"
+_DEFAULT_TENSILE = str(_BUILD_TENSILE if _BUILD_TENSILE.exists() else _LOCAL_TENSILE)
+TENSILE_WD = Path(os.environ.get("TENSILE_WD", _DEFAULT_TENSILE))
 
 # ---------------------------------------------------------------------------
 # Rotating buffer auto-sizing
@@ -346,7 +348,8 @@ def read_template(template_path=None):
 
 
 def gen_yaml(shape, header, footer, out_path, origami_top_n=0, dtype="bf16"):
-    M, N, K = shape["M"], shape["N"], shape["K"]
+    # Swap M↔N: PyTorch row-major (M,K)@(N,K).T uses BLAS col-major m=N, n=M
+    M, N, K = shape["N"], shape["M"], shape["K"]
     trans_a = bool(shape.get("trans_a", True))
     trans_b = bool(shape.get("trans_b", False))
 
@@ -393,6 +396,26 @@ def gen_yaml(shape, header, footer, out_path, origami_top_n=0, dtype="bf16"):
 # Run Tensile
 # ---------------------------------------------------------------------------
 
+
+def _find_rocisa_lib(tensile_wd: Path) -> str:
+    """Locate the rocisa shared library directory for *tensile_wd*.
+
+    When using the build-tree Tensile the pre-built rocisa lives under the
+    hipBLASLt build directory rather than a local build_tmp.
+    """
+    candidates = [
+        # init_build.sh puts rocisa here (invoke build-client)
+        tensile_wd / "build_tmp" / "tensilelite" / "rocisa" / "lib",
+        # hipblaslt cmake build puts rocisa here
+        tensile_wd.parent / "build" / "tensilelite" / "rocisa" / "lib",
+    ]
+    for p in candidates:
+        if p.exists():
+            return str(p)
+    # Fallback — let TENSILELITE_ENABLE_AUTOBUILD handle it
+    return str(candidates[-1])
+
+
 def run_tensile(yaml_path, case_dir, device=None):
     if device is not None:
         text = yaml_path.read_text()
@@ -402,7 +425,7 @@ def run_tensile(yaml_path, case_dir, device=None):
 
     env = os.environ.copy()
     tensile_wd = TENSILE_WD
-    rocisa_lib = str(tensile_wd / "build_tmp" / "tensilelite" / "rocisa" / "lib")
+    rocisa_lib = _find_rocisa_lib(tensile_wd)
     env["PYTHONPATH"] = env.get("PYTHONPATH", "") + ":" + rocisa_lib
     env["TENSILELITE_ENABLE_AUTOBUILD"] = "ON"
     if device is not None:
@@ -526,6 +549,7 @@ def run_hipblaslt_bench(M, N, K, trans_a=True, trans_b=False,
         bench_env = os.environ.copy()
         bench_env["HIP_VISIBLE_DEVICES"] = str(device)
         bench_env["CUDA_VISIBLE_DEVICES"] = str(device)
+    cmd_str = " ".join(cmd)
     print(f"  hipblaslt-bench: running ...", end="", flush=True)
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
@@ -541,6 +565,7 @@ def run_hipblaslt_bench(M, N, K, trans_a=True, trans_b=False,
                 f.write(output)
 
         parsed = _parse_hipblaslt_output(output)
+        parsed["cmd"] = cmd_str
         if parsed["tflops"] is not None:
             print(f"\r  hipblaslt-bench: {parsed['tflops']:.1f} TFLOPS{' '*20}")
         else:
@@ -701,14 +726,31 @@ def _write_shape_report(row, path):
         "| Method | TFLOPS | Time (us) | vs hipblaslt-bench |",
         "|--------|-------:|----------:|-------------------:|",
         f"| **Tensile tuned** | {_v(t_tflops)} | {_v(t_us)} | {_ratio(t_tflops)} |",
-        f"| **hipblaslt-bench** | {_v(b_tflops)} | {_v(b_us)} | — |",
+        f"| **hipblaslt-bench (stock)** | {_v(b_tflops)} | {_v(b_us)} | — |",
         "",
+    ]
+    if t_tflops and b_tflops and b_tflops > 0:
+        lines.append(f"> **Tuned/Bench ratio:** {t_tflops/b_tflops:.2%}")
+        lines.append("")
+
+    lines += [
         "## Kernels",
         "",
         f"- **Tensile winner**: `{t_kernel or 'N/A'}`",
         f"- **hipblaslt-bench**: `{b_kernel or 'N/A'}`",
         "",
     ]
+
+    bench_cmd = row.get("bench_cmd")
+    if bench_cmd:
+        lines += [
+            "## Reproduce hipblaslt-bench",
+            "",
+            "```bash",
+            bench_cmd,
+            "```",
+            "",
+        ]
 
     shared_diffs, t_only, b_only = _kernel_param_diff(t_kernel, b_kernel)
     if shared_diffs or t_only or b_only:
@@ -789,8 +831,9 @@ def _process_one_shape(shape, idx, total, header, footer, out_dir, args, device)
 
     bench_result = None
     if args.run or args.compare_only:
+        # hipblaslt-bench expects BLAS col-major dims: m=N, n=M
         bench_result = run_hipblaslt_bench(
-            shape["M"], shape["N"], shape["K"],
+            shape["N"], shape["M"], shape["K"],
             trans_a=shape.get("trans_a", True),
             trans_b=shape.get("trans_b", False),
             log_dir=out_dir, device=device, dtype=dtype,
@@ -811,6 +854,7 @@ def _process_one_shape(shape, idx, total, header, footer, out_dir, args, device)
         "bench_tflops": bench_result["tflops"] if bench_result else None,
         "bench_time_us": bench_result["time_us"] if bench_result else None,
         "bench_kernel": bench_result["kernel_name"] if bench_result else None,
+        "bench_cmd": bench_result.get("cmd") if bench_result else None,
     }
 
     _write_shape_report(row, out_dir / f"{sid}.report.md")
@@ -839,9 +883,9 @@ def _process_one_shape(shape, idx, total, header, footer, out_dir, args, device)
 
 def print_report(results, dtype="bf16"):
     dtype_label = dtype.upper()
-    print(f"\n{'='*120}")
-    print(f"COMPARISON REPORT: Tensile tuned {dtype_label} GEMM vs hipblaslt-bench")
-    print(f"{'='*120}")
+    print(f"\n{'='*140}")
+    print(f"COMPARISON REPORT: Tensile tuned {dtype_label} GEMM vs stock baseline")
+    print(f"{'='*140}")
     hdr = (f"{'Model':<18} {'Layer':<14} {'Phase':<6} {'MBS':>4} {'Trans':>5} "
            f"{'M':>6} {'N':>6} {'K':>6}  "
            f"{'Tensile':>10} {'Bench':>10} {'T/B':>8}")
@@ -852,12 +896,13 @@ def print_report(results, dtype="bf16"):
         b = r["bench_tflops"]
         t_s = f"{t:.2f}" if t else "N/A"
         b_s = f"{b:.2f}" if b else "N/A"
-        ratio = f"{t/b:.2%}" if (t and b and b > 0) else "N/A"
+        tb_ratio = f"{t/b:.2%}" if (t and b and b > 0) else "N/A"
         print(f"{r['model']:<18} {r['layer']:<14} {r.get('phase', 'fwd'):<6} {r['mbs']:>4} "
               f"{r.get('trans', 'TNN'):>5} "
               f"{r['M']:>6} {r['N']:>6} {r['K']:>6}  "
-              f"{t_s:>10} {b_s:>10} {ratio:>8}")
-    print(f"{'='*128}")
+              f"{t_s:>10} {b_s:>10} {tb_ratio:>8}")
+    print(f"{'='*120}")
+    print(f"  T/B = Tensile tuned / hipblaslt-bench stock")
 
 
 def save_report_csv(results, path):
@@ -947,6 +992,9 @@ def main():
     if not (args.run or args.gen_only or args.compare_only):
         parser.print_help()
         return
+
+    print(f"Tensile working directory: {TENSILE_WD}")
+    print(f"  rocisa lib: {_find_rocisa_lib(TENSILE_WD)}")
 
     if args.template:
         template_path = Path(args.template)
