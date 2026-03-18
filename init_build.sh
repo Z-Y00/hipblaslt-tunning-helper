@@ -10,7 +10,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-GIT_CACHE="/workspace/.git-cache"
+GIT_CACHE="$SCRIPT_DIR/.git-cache"
 
 # ── Cache git repos used by cmake FetchContent ───────────────────────────
 # Creates local bare mirrors and configures git to use them instead of
@@ -55,6 +55,20 @@ if [ -d "$_BUILD_TENSILE/Tensile" ]; then
 else
   TENSILE_DIR="$_LOCAL_TENSILE"
   echo "Using local submodule Tensile: $TENSILE_DIR"
+fi
+
+# ── Apply Cosmo patches to Tensile ────────────────────────────────────────
+PATCH="$SCRIPT_DIR/patches/0001-cosmo-tensile-tuning-fixes.rocm-libraries.patch"
+if [ -f "$PATCH" ] && [ "$TENSILE_DIR" = "$_BUILD_TENSILE" ]; then
+  MONO_REPO="$SCRIPT_DIR/tmp_rebuild/rocm-libraries"
+  if cd "$MONO_REPO" && git apply --check "$PATCH" 2>/dev/null; then
+    echo "=== Applying Cosmo Tensile patches ==="
+    git apply "$PATCH"
+    echo "  Patch applied successfully"
+  else
+    echo "  Cosmo patches already applied or not needed (skipping)"
+  fi
+  cd "$SCRIPT_DIR"
 fi
 
 apt update && apt install -y rocm-llvm-dev

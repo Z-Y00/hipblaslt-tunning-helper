@@ -21,11 +21,6 @@ git sparse-checkout init --cone
 git sparse-checkout set shared/origami
 cd ..
 
-# (Optional) Install Origami for analytical search-space pruning
-cd origami/shared/origami/python
-CMAKE_PREFIX_PATH=/opt/rocm CMAKE_CXX_COMPILER=/opt/rocm/bin/amdclang++ pip install -e .
-cd ../../../..
-
 # Build TensileLite client and install Origami
 ./init_build.sh
 ```

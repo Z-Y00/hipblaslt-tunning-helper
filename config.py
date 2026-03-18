@@ -40,7 +40,7 @@ _turbo_cfg = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_turbo_cfg)
 
 BATCH_SIZE_LIST = list(range(1,10)) # _turbo_cfg.BATCH_SIZE_LIST
-BATCH_SIZE_LIST = [1]
+# BATCH_SIZE_LIST = [1]
 DenseModelConfigs = _turbo_cfg.DenseModelConfigs
 gen_gemm_test_cases = _turbo_cfg.gen_gemm_test_cases
 

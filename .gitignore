@@ -1,7 +1,10 @@
 tunning_results/
 __pycache__/
-*.log
+*.log*
 *.o
 *.co
 .rocprofv3/
 a.out
+.git-cache/
+smci*
+*.out

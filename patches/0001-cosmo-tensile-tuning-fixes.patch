@@ -1,0 +1,488 @@
+From 7e2615bb5ccce1d62e0db7d5b5f151b804e77b9c Mon Sep 17 00:00:00 2001
+From: Lorri Rao <zouyoo@outlook.com>
+Date: Fri, 13 Mar 2026 22:38:37 +0000
+Subject: [PATCH] Cosmo development patches for Tensile tuning
+
+Aggregated fixes from cosmo workspace:
+- Fix TFLOPS reporting for grouped GEMM (sum all sub-gemms)
+- Fix int32 overflow in rotating buffer size calculation
+- Fix int32 overflow in rotating-buffer-size CLI arg parsing
+- Add hipMalloc error handling in RotatingMemory
+- Add hsaco filename alias for xnack-qualified targets
+- Guard empty/invalid assembly in TensileCreateLibrary
+- Replace glibc rand() with thread-local RNG to avoid lock contention
+- Fix origami setup.py for editable install
+---
+ .../Tensile/TensileCreateLibrary/Run.py       | 24 ++++++++--
+ tensilelite/Tensile/Toolchain/Assembly.py     |  8 +++-
+ tensilelite/Tensile/Toolchain/Source.py       | 11 ++++-
+ .../Tensile/Utilities/origami/setup.py        |  8 +++-
+ .../client/include/DataInitialization.hpp     | 44 ++++++++++++-------
+ tensilelite/client/include/Rotating.hpp       |  1 +
+ tensilelite/client/src/BenchmarkTimer.cpp     |  4 +-
+ tensilelite/client/src/DataInitialization.cpp | 34 ++++++++++----
+ tensilelite/client/src/ProgressListener.cpp   |  4 ++
+ tensilelite/client/src/Rotating.cpp           | 27 +++++++++++-
+ 10 files changed, 130 insertions(+), 35 deletions(-)
+
+diff --git a/tensilelite/Tensile/TensileCreateLibrary/Run.py b/tensilelite/Tensile/TensileCreateLibrary/Run.py
+index 22d19851a..5b0bc5416 100644
+--- a/tensilelite/Tensile/TensileCreateLibrary/Run.py
++++ b/tensilelite/Tensile/TensileCreateLibrary/Run.py
+@@ -124,7 +124,11 @@ def removeInvalidSolutionsAndKernels(results, kernels, solutions, errorTolerant,
+     for kernIdx, r in (
+         tqdm(enumerate(results)) if printLevel > 1 else enumerate(results)
+     ):
+-        if r.err != 0:
++        isInvalid = r.err != 0
++        if not isInvalid and not r.src and not kernels[kernIdx].duplicate:
++            isInvalid = True
++            printWarning(f"Kernel {r.name} generated empty source without error flag, marking as invalid")
++        if isInvalid:
+             if not errorTolerant:
+                 print(
+                     "\nKernel generation failed for kernel: {}".format(
+@@ -289,7 +293,13 @@ def writeSolutionsAndKernels(
+ 
+     def assemble(ret):
+         p, isa, wavefrontsize, _ = ret
+-        asmToolchain.assembler(isaToGfx(isa), wavefrontsize, str(p), str(p.with_suffix(".o")))
++        if p.stat().st_size == 0:
++            print(f"Tensile::WARNING: Skipping empty assembly file: {p}")
++            return
++        try:
++            asmToolchain.assembler(isaToGfx(isa), wavefrontsize, str(p), str(p.with_suffix(".o")))
++        except RuntimeError as e:
++            printWarning(f"Assembly failed for {p.name}, skipping: {str(e)[:200]}")
+ 
+     unaryWriteAssembly = functools.partial(writeAssembly, assemblyTmpPath)
+     compose = lambda *F: functools.reduce(lambda f, g: lambda x: f(g(x)), F)
+@@ -378,7 +388,15 @@ def writeSolutionsAndKernelsTCL(
+ 
+     def assemble(ret, removeTemporaries: bool):
+         asmPath, isa, wavefrontsize, result = ret
+-        asmToolchain.assembler(isaToGfx(isa), wavefrontsize, str(asmPath), str(asmPath.with_suffix(".o")))
++        if asmPath.stat().st_size == 0:
++            print(f"Tensile::WARNING: Skipping empty assembly file: {asmPath}")
++            if removeTemporaries:
++                asmPath.unlink()
++            return result
++        try:
++            asmToolchain.assembler(isaToGfx(isa), wavefrontsize, str(asmPath), str(asmPath.with_suffix(".o")))
++        except RuntimeError as e:
++            printWarning(f"Assembly failed for {asmPath.name}, skipping: {str(e)[:200]}")
+         if removeTemporaries:
+             asmPath.unlink()
+         return result
+diff --git a/tensilelite/Tensile/Toolchain/Assembly.py b/tensilelite/Tensile/Toolchain/Assembly.py
+index a8b91e8d6..df0ad2c81 100644
+--- a/tensilelite/Tensile/Toolchain/Assembly.py
++++ b/tensilelite/Tensile/Toolchain/Assembly.py
+@@ -93,7 +93,13 @@ def buildAssemblyCodeObjectFiles(
+           coFileMap[asmDir / (coName + extCoRaw)].add(str(asmDir / (kernel["BaseName"] + extObj)))
+ 
+       for coFileRaw, objFiles in coFileMap.items():
+-        linker(objFiles, str(coFileRaw))
++        existingObjFiles = [f for f in objFiles if Path(f).exists()]
++        if not existingObjFiles:
++          continue
++        if len(existingObjFiles) < len(objFiles):
++          skipped = len(objFiles) - len(existingObjFiles)
++          print(f"Tensile::WARNING: Skipping {skipped} missing object file(s) for {coFileRaw.name}")
++        linker(existingObjFiles, str(coFileRaw))
+         coFile = destDir / coFileRaw.name.replace(extCoRaw, extCo)
+         if compress:
+           bundler.compress(str(coFileRaw), str(coFile), gfx)
+diff --git a/tensilelite/Tensile/Toolchain/Source.py b/tensilelite/Tensile/Toolchain/Source.py
+index c9862e6cc..d5c5d602e 100644
+--- a/tensilelite/Tensile/Toolchain/Source.py
++++ b/tensilelite/Tensile/Toolchain/Source.py
+@@ -57,6 +57,7 @@ def _computeSourceCodeObjectFilename(target: str, base: str, buildPath: Union[Pa
+     """
+     coPath = None
+     buildPath = Path(buildPath)
++
+     if "TensileLibrary" in base and "fallback" in base:
+         coPath = buildPath / "{0}_{1}.hsaco.raw".format(base, arch)
+     elif "TensileLibrary" in base:
+@@ -65,7 +66,7 @@ def _computeSourceCodeObjectFilename(target: str, base: str, buildPath: Union[Pa
+         if arch in baseVariant:
+             coPath = buildPath / (baseVariant + ".hsaco.raw")
+     else:
+-        coPath= buildPath / "{0}.so-000-{1}.hsaco.raw".format(base, arch)
++        coPath = buildPath / "{0}.so-000-{1}.hsaco.raw".format(base, arch)
+ 
+     return coPath
+ 
+@@ -118,6 +119,14 @@ def buildSourceCodeObjectFiles(
+ 
+     for src, dst in zip(coPathsRaw, coPaths):
+         shutil.move(src, dst)
++        # Runtime may request helper hsaco without target-feature suffix while
++        # toolchain emits feature-qualified names (e.g. gfx950-xnack+). Keep an
++        # unsuffixed alias so lazy-loading dependencies resolve consistently.
++        alias = re.sub(r"((?:\.so-000-)(gfx[0-9a-f]+))-(?:xnack[+-]|sramecc[+-])(\.hsaco)$",
++                       r"\1\3",
++                       dst)
++        if alias != dst and not Path(alias).exists():
++            shutil.copy2(dst, alias)
+ 
+     stop = timer()
+     print1(f"buildSourceCodeObjectFile time (s): {(stop-start):3.2f}")
+diff --git a/tensilelite/Tensile/Utilities/origami/setup.py b/tensilelite/Tensile/Utilities/origami/setup.py
+index 345a8c7f1..5db1f46db 100644
+--- a/tensilelite/Tensile/Utilities/origami/setup.py
++++ b/tensilelite/Tensile/Utilities/origami/setup.py
+@@ -38,8 +38,14 @@ if __name__ == "__main__":
+     sys.argv = [sys.argv[0]] + unknown  # Preserve unrecognized arguments for setuptools
+ 
+     source_dir = Path(args.source)
++    # Try standard layout first, fall back to tensilelite repo layout
+     cpp_path = source_dir / "lib" / "source" / "analytical" / "*.cpp"
+     cpp_files = sorted(glob.glob(str(cpp_path)))
++    include_dir = str(source_dir / "lib" / "include")
++    if not cpp_files:
++        cpp_path = source_dir / "src" / "analytical" / "*.cpp"
++        cpp_files = sorted(glob.glob(str(cpp_path)))
++        include_dir = str(source_dir / "include")
+ 
+     cpp_files = ["origami_module.cpp"] + cpp_files
+ 
+@@ -49,7 +55,7 @@ if __name__ == "__main__":
+             cpp_files,
+             include_dirs=[
+                 pybind11.get_include(),
+-                str(source_dir / "lib" / "include"),
++                include_dir,
+                 os.path.join(ROCM_PATH, "include"),
+             ],
+             language="c++",
+diff --git a/tensilelite/client/include/DataInitialization.hpp b/tensilelite/client/include/DataInitialization.hpp
+index 6056e69f0..cea012a59 100644
+--- a/tensilelite/client/include/DataInitialization.hpp
++++ b/tensilelite/client/include/DataInitialization.hpp
+@@ -39,6 +39,16 @@
+ 
+ #include "RunListener.hpp"
+ 
++namespace
++{
++    // Thread-local RNG to avoid glibc rand() global lock contention under OpenMP.
++    inline int tl_rand()
++    {
++        thread_local std::minstd_rand rng(std::random_device{}());
++        return static_cast<int>(rng() & 0x7fffffff);
++    }
++}
++
+ namespace po = boost::program_options;
+ 
+ namespace TensileLite
+@@ -1065,7 +1075,7 @@ namespace TensileLite
+         template <>
+         inline float DataInitialization::getValue<float, InitMode::Random>()
+         {
+-            return static_cast<float>((rand() % 201) - 100);
++            return static_cast<float>((tl_rand() % 201) - 100);
+         }
+ 
+         template <>
+@@ -1135,7 +1145,7 @@ namespace TensileLite
+         template <>
+         inline double DataInitialization::getValue<double, InitMode::Random>()
+         {
+-            return static_cast<double>((rand() % 2001) - 1000);
++            return static_cast<double>((tl_rand() % 2001) - 1000);
+         }
+ 
+         template <>
+@@ -1377,7 +1387,7 @@ namespace TensileLite
+         template <>
+         inline int32_t DataInitialization::getValue<int32_t, InitMode::Random>()
+         {
+-            return rand() % 7 - 3;
++            return tl_rand() % 7 - 3;
+         }
+ 
+         template <>
+@@ -1440,10 +1450,10 @@ namespace TensileLite
+         template <>
+         inline Int8x4 DataInitialization::getValue<Int8x4, InitMode::Random>()
+         {
+-            return Int8x4{static_cast<int8_t>((rand() % 7) - 3),
+-                          static_cast<int8_t>((rand() % 7) - 3),
+-                          static_cast<int8_t>((rand() % 7) - 3),
+-                          static_cast<int8_t>((rand() % 7) - 3)};
++            return Int8x4{static_cast<int8_t>((tl_rand() % 7) - 3),
++                          static_cast<int8_t>((tl_rand() % 7) - 3),
++                          static_cast<int8_t>((tl_rand() % 7) - 3),
++                          static_cast<int8_t>((tl_rand() % 7) - 3)};
+         }
+ 
+         template <>
+@@ -1537,7 +1547,7 @@ namespace TensileLite
+         template <>
+         inline Half DataInitialization::getValue<Half, InitMode::Random>()
+         {
+-            return static_cast<Half>((rand() % 7) - 3);
++            return static_cast<Half>((tl_rand() % 7) - 3);
+         }
+ 
+         template <>
+@@ -1604,7 +1614,7 @@ namespace TensileLite
+         template <>
+         inline BFloat16 DataInitialization::getValue<BFloat16, InitMode::Random>()
+         {
+-            return static_cast<BFloat16>((rand() % 7) - 3);
++            return static_cast<BFloat16>((tl_rand() % 7) - 3);
+         }
+ 
+         template <>
+@@ -1712,7 +1722,7 @@ namespace TensileLite
+         template <>
+         inline Float8 DataInitialization::getValue<Float8, InitMode::Random>()
+         {
+-            return static_cast<Float8>((float)((rand() % 7) - 3));
++            return static_cast<Float8>((float)((tl_rand() % 7) - 3));
+         }
+ 
+         template <>
+@@ -1779,7 +1789,7 @@ namespace TensileLite
+         template <>
+         inline BFloat8 DataInitialization::getValue<BFloat8, InitMode::Random>()
+         {
+-            return static_cast<BFloat8>((float)((rand() % 7) - 3));
++            return static_cast<BFloat8>((float)((tl_rand() % 7) - 3));
+         }
+ 
+         template <>
+@@ -1923,7 +1933,7 @@ namespace TensileLite
+         template <>
+         inline Float8_fnuz DataInitialization::getValue<Float8_fnuz, InitMode::Random>()
+         {
+-            return static_cast<Float8_fnuz>((float)((rand() % 7) - 3));
++            return static_cast<Float8_fnuz>((float)((tl_rand() % 7) - 3));
+         }
+ 
+         template <>
+@@ -1990,7 +2000,7 @@ namespace TensileLite
+         template <>
+         inline BFloat8_fnuz DataInitialization::getValue<BFloat8_fnuz, InitMode::Random>()
+         {
+-            return static_cast<BFloat8_fnuz>((float)((rand() % 7) - 3));
++            return static_cast<BFloat8_fnuz>((float)((tl_rand() % 7) - 3));
+         }
+ 
+         template <>
+@@ -2088,7 +2098,7 @@ namespace TensileLite
+         template <>
+         inline int8_t DataInitialization::getValue<int8_t, InitMode::Random>()
+         {
+-            return static_cast<int8_t>((rand() % 7) - 3);
++            return static_cast<int8_t>((tl_rand() % 7) - 3);
+         }
+ 
+         template <>
+@@ -2605,14 +2615,14 @@ namespace TensileLite
+         inline T getValueWithUpperLowerBoundFP(double upper = 1.0, double lower = -1.0)
+         {
+             return static_cast<T>(lower
+-                                  + static_cast<double>(rand())
+-                                        / static_cast<double>(RAND_MAX / (upper - lower)));
++                                  + static_cast<double>(tl_rand())
++                                        / static_cast<double>(0x7fffffff / (upper - lower)));
+         }
+ 
+         template <typename T>
+         inline T getValueWithUpperLowerBoundInteger(int upper = 128, int lower = -128)
+         {
+-            return static_cast<T>(lower + rand() % (upper - lower + 1));
++            return static_cast<T>(lower + tl_rand() % (upper - lower + 1));
+         }
+ 
+         template <>
+diff --git a/tensilelite/client/include/Rotating.hpp b/tensilelite/client/include/Rotating.hpp
+index df1372cdb..ff22f1675 100644
+--- a/tensilelite/client/include/Rotating.hpp
++++ b/tensilelite/client/include/Rotating.hpp
+@@ -49,6 +49,7 @@ namespace TensileLite
+         explicit RotatingMemory(size_t num) : m_rotatingBufferNum(num) {}
+         ~RotatingMemory() {}
+         void addRotatingSize(std::vector<size_t> sizes);
++        void ensureMinRotatingSize(size_t tensorIdx, size_t minBytes);
+         void createRotatingMemory(int32_t mode, size_t rotatingSize);
+         std::vector<std::vector<RotatingMemoryUnit>> getRotatingMemory() const;
+         std::shared_ptr<void> getData() const;
+diff --git a/tensilelite/client/src/BenchmarkTimer.cpp b/tensilelite/client/src/BenchmarkTimer.cpp
+index a69cc817b..219693648 100644
+--- a/tensilelite/client/src/BenchmarkTimer.cpp
++++ b/tensilelite/client/src/BenchmarkTimer.cpp
+@@ -171,7 +171,9 @@ namespace TensileLite
+             if(auto problem = dynamic_cast<ContractionProblemGroupedGemm*>(m_problem))
+             {
+                 pp        = m_solution.projectedPerformance(problem->gemms[0], m_hardware);
+-                flopCount = problem->gemms[0].flopCount();
++                flopCount = 0.0;
++                for(auto& gemm : problem->gemms)
++                    flopCount += gemm.flopCount();
+             }
+             else if(auto problem = dynamic_cast<ContractionProblemGemm*>(m_problem))
+             {
+diff --git a/tensilelite/client/src/DataInitialization.cpp b/tensilelite/client/src/DataInitialization.cpp
+index 834446c0c..64fd15eee 100644
+--- a/tensilelite/client/src/DataInitialization.cpp
++++ b/tensilelite/client/src/DataInitialization.cpp
+@@ -885,7 +885,7 @@ namespace TensileLite
+ 
+         {
+             m_rotatingBuffer
+-                = args["rotating-buffer-size"].as<int32_t>() * 1024 * 1024; // Change to bytes
++                = static_cast<int64_t>(args["rotating-buffer-size"].as<int32_t>()) * 1024 * 1024; // Change to bytes
+             m_rotatingMode   = args["rotating-buffer-mode"].as<int32_t>();
+             m_boundsCheck    = args["bounds-check"].as<BoundsCheckMode>();
+             m_curBoundsCheck = m_boundsCheck;
+@@ -1208,6 +1208,22 @@ namespace TensileLite
+                           << ToString(m_vdata[i].init) << std::endl;
+             }
+ 
++            // Sync rotating memory sizes with inflated maxElements (bounds-check
++            // rounding may have enlarged maxElements beyond what was originally
++            // registered with addRotatingSize)
++            if(m_rotatingBuffer > 0 && m_rm)
++            {
++                for(size_t i = 0; i < m_vdata.size(); i++)
++                {
++                    for(auto& p : m_vdata[i].pristine)
++                    {
++                        size_t neededBytes
++                            = DataTypeInfo::Get(p.first).elementSize * p.second.maxElements;
++                        m_rm->ensureMinRotatingSize(i, neededBytes);
++                    }
++                }
++            }
++
+             // Init contants
+             for(size_t i = 0; i < m_cdata.size(); i++)
+             {
+@@ -2504,21 +2520,21 @@ namespace TensileLite
+             {
+                 auto    castInputs   = static_pointer_cast<ContractionInputs>(inputs);
+                 size_t  rotatingSize = getRotatingSize(*gemmProblem, *castInputs);
+-                int32_t rotatingNum
++                int64_t rotatingNum
+                     = min(maxRotatingBufferNum, ceil((float)m_rotatingBuffer / rotatingSize))
+                       - 1; // Minus the original buffer.
+ 
+                 // <= 0 means don't rotating
+-                rotatingNum = max(0, rotatingNum);
++                rotatingNum = max((int64_t)0, rotatingNum);
+ 
+-                int32_t totalRotatingSizeNeeded = rotatingNum * rotatingSize;
++                int64_t totalRotatingSizeNeeded = rotatingNum * rotatingSize;
+                 std::cout << "Rotating buffer set to: " << m_rotatingBuffer
+                           << ". Rotating num: " << rotatingNum << std::endl;
+                 if(m_rotatingMode == 0)
+                 {
+                     auto rotatingAllocatedSize
+                         = m_rm->getDataSize() - m_rm->getDataLargestUnitSize();
+-                    if(totalRotatingSizeNeeded > rotatingAllocatedSize)
++                    if(totalRotatingSizeNeeded > (int64_t)rotatingAllocatedSize)
+                     {
+                         std::cout << "Rotating buffer size: " << rotatingAllocatedSize
+                                   << " is not enough for rotating buffer size: " << rotatingSize
+@@ -2566,21 +2582,21 @@ namespace TensileLite
+                     rotatingSize
+                         += getRotatingSize(groupedProblem->gemms[i], castInputs->grouped[i]);
+                 }
+-                int32_t rotatingNum
++                int64_t rotatingNum
+                     = min(maxRotatingBufferNum, ceil((float)m_rotatingBuffer / rotatingSize))
+                       - 1; // Minus the original buffer.
+ 
+                 // <= 0 means don't rotating
+-                rotatingNum = max(0, rotatingNum);
++                rotatingNum = max((int64_t)0, rotatingNum);
+ 
+-                int32_t totalRotatingSizeNeeded = rotatingNum * rotatingSize;
++                int64_t totalRotatingSizeNeeded = rotatingNum * rotatingSize;
+                 std::cout << "Rotating buffer set to: " << m_rotatingBuffer
+                           << ". Rotating num: " << rotatingNum << std::endl;
+                 if(m_rotatingMode == 0)
+                 {
+                     auto rotatingAllocatedSize
+                         = m_rm->getDataSize() - m_rm->getDataLargestUnitSize();
+-                    if(totalRotatingSizeNeeded > rotatingAllocatedSize)
++                    if(totalRotatingSizeNeeded > (int64_t)rotatingAllocatedSize)
+                     {
+                         std::cout << "Rotating buffer size: " << rotatingAllocatedSize
+                                   << " is not enough for rotating buffer size: " << rotatingSize
+diff --git a/tensilelite/client/src/ProgressListener.cpp b/tensilelite/client/src/ProgressListener.cpp
+index 9d82efc8e..f68c80622 100644
+--- a/tensilelite/client/src/ProgressListener.cpp
++++ b/tensilelite/client/src/ProgressListener.cpp
+@@ -100,6 +100,10 @@ namespace TensileLite
+             if(auto groupedProblem = dynamic_cast<const ContractionProblemGroupedGemm*>(problem))
+             {
+                 writeReport(groupedProblem->gemms[0]);
++                double totalFlops = 0.0;
++                for(auto& it : groupedProblem->gemms)
++                    totalFlops += it.flopCount();
++                m_reporter->report(ResultKey::TotalFlops, totalFlops);
+                 std::vector<std::vector<size_t>> sizes;
+                 for(auto& it : groupedProblem->gemms)
+                     sizes.push_back(it.problemSizes());
+diff --git a/tensilelite/client/src/Rotating.cpp b/tensilelite/client/src/Rotating.cpp
+index 1a031df35..9564c5eba 100644
+--- a/tensilelite/client/src/Rotating.cpp
++++ b/tensilelite/client/src/Rotating.cpp
+@@ -29,6 +29,8 @@
+ #include <hip/hip_runtime.h>
+ #include <iostream>
+ #include <math.h>
++#include <sstream>
++#include <stdexcept>
+ 
+ namespace TensileLite
+ {
+@@ -46,6 +48,19 @@ namespace TensileLite
+         m_rotatingInfo.push_back(RotatingUnitInfo{sizes, totalSize, 0});
+     }
+ 
++    void RotatingMemory::ensureMinRotatingSize(size_t tensorIdx, size_t minBytes)
++    {
++        for(auto& info : m_rotatingInfo)
++        {
++            if(tensorIdx < info.sizes.size() && info.sizes[tensorIdx] > 0
++               && info.sizes[tensorIdx] < minBytes)
++            {
++                info.totalSize += (minBytes - info.sizes[tensorIdx]);
++                info.sizes[tensorIdx] = minBytes;
++            }
++        }
++    }
++
+     void RotatingMemory::createRotatingMemory(int32_t mode, size_t rotatingSize)
+     {
+         // Check how many rotating units are needed
+@@ -111,8 +126,16 @@ namespace TensileLite
+         m_size = totalSize;
+         m_largestUnitSize = largestUnitSize;
+ 
+-        void* ptr   = nullptr;
+-        static_cast<void>(hipMalloc(&ptr, totalSize));
++        void*      ptr = nullptr;
++        hipError_t err = hipMalloc(&ptr, totalSize);
++        if(err != hipSuccess || ptr == nullptr)
++        {
++            std::ostringstream msg;
++            msg << "Failed to allocate rotating memory: " << totalSize
++                << " bytes (" << (totalSize / (1024.0 * 1024.0)) << " MB). "
++                << "hipMalloc returned " << hipGetErrorString(err);
++            throw std::runtime_error(msg.str());
++        }
+         m_data = std::shared_ptr<void>(ptr, hipFree);
+         std::cout << "Rotating memory size: " << totalSize << std::endl;
+ 
+-- 
+2.43.0
+

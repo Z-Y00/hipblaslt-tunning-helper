@@ -23,7 +23,7 @@
 #   ./build_hipblaslt.sh --no-gate          # merge all, skip regression gate
 #
 # Verify tuned kernels at runtime:
-#   TENSILE_DB=32768 python3 your_benchmark.py
+#   TENSILE_DB=0xFFFF python3 your_benchmark.py
 #   HIPBLASLT_LOG_MASK=128 HIPBLASLT_LOG_FILE=./trace_%i.log python3 your_benchmark.py
 set -euo pipefail
 
@@ -255,7 +255,7 @@ verify_tuned_kernel() {
   if [ ! -x "$bench" ]; then
     echo "  hipblaslt-bench not found, skipping verification."
     echo "  You can verify manually with:"
-    echo "    TENSILE_DB=32768 hipblaslt-bench -m 4096 -n 12288 -k 4096 --precision bf16_r --compute_type f32_r --transA T --transB N -i 10 -j 5 --rotating 512 --print_kernel_info"
+    echo "    TENSILE_DB=0xFFFF hipblaslt-bench -m 4096 -n 12288 -k 4096 --precision bf16_r --compute_type f32_r --transA T --transB N -i 10 -j 5 --rotating 512 --print_kernel_info"
     return 0
   fi
 
@@ -265,7 +265,7 @@ verify_tuned_kernel() {
 
   set +e
   local output
-  output=$(TENSILE_DB=32768 "$bench" \
+  output=$(TENSILE_DB=0xFFFF "$bench" \
     -m 4096 -n 12288 -k 4096 \
     --precision bf16_r --compute_type f32_r \
     --transA T --transB N \
@@ -320,7 +320,7 @@ verify_turbo_pytorch() {
 
   set +e
   local output
-  output=$(TENSILE_DB=32768 python3 - 2>&1 <<'PYEOF'
+  output=$(TENSILE_DB=0xFFFF python3 - 2>&1 <<'PYEOF'
 import torch
 import torch.utils.benchmark as benchmark
 import sys, os
@@ -418,7 +418,7 @@ echo ""
 log "Done"
 echo ""
 echo "To verify tuned kernels in your own code:"
-echo "  TENSILE_DB=32768 python3 your_benchmark.py"
+echo "  TENSILE_DB=0xFFFF python3 your_benchmark.py"
 echo ""
 echo "  # Extended profile (solution + kernel names to log file):"
 echo "  HIPBLASLT_LOG_MASK=128 HIPBLASLT_LOG_FILE=./trace_%i.log python3 your_benchmark.py"

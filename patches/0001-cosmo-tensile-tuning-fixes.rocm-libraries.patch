@@ -1,0 +1,286 @@
+diff --git a/projects/hipblaslt/tensilelite/Tensile/TensileCreateLibrary/Run.py b/projects/hipblaslt/tensilelite/Tensile/TensileCreateLibrary/Run.py
+index 42559c1182..ef490e2223 100644
+--- a/projects/hipblaslt/tensilelite/Tensile/TensileCreateLibrary/Run.py
++++ b/projects/hipblaslt/tensilelite/Tensile/TensileCreateLibrary/Run.py
+@@ -126,7 +126,11 @@ def processKernelSource(kernelWriterAssembly, data, outOptions, splitGSU, kernel
+     )
+ 
+ def _checkInvalidSolutionsAndKernels(errorTolerant, result, kernel):
+-    if result.err != 0:
++    isInvalid = result.err != 0
++    if not isInvalid and not result.src and not kernel.get("Duplicate", False):
++        isInvalid = True
++        printWarning(f"Kernel {kernel.get('SolutionNameMin', '?')} generated empty source without error flag, marking as invalid")
++    if isInvalid:
+         if not errorTolerant:
+             print(
+                 "\nKernel generation failed for kernel: {}".format(
+@@ -375,7 +379,13 @@ def writeSolutionsAndKernels(
+ 
+     def assemble(ret):
+         p, isa, wavefrontsize, _ = ret
+-        asmToolchain.assembler(isaToGfx(isa), wavefrontsize, str(p), str(p.with_suffix(".o")))
++        if p.stat().st_size == 0:
++            print(f"Tensile::WARNING: Skipping empty assembly file: {p}")
++            return
++        try:
++            asmToolchain.assembler(isaToGfx(isa), wavefrontsize, str(p), str(p.with_suffix(".o")))
++        except RuntimeError as e:
++            printWarning(f"Assembly failed for {p.name}, skipping: {str(e)[:200]}")
+ 
+     unaryWriteAssembly = functools.partial(writeAssembly, assemblyTmpPath)
+     compose = lambda *F: functools.reduce(lambda f, g: lambda x: f(g(x)), F)
+@@ -469,7 +479,15 @@ def writeSolutionsAndKernelsTCL(
+ 
+     def assemble(ret, removeTemporaries: bool):
+         asmPath, isa, wavefrontsize, result = ret
+-        asmToolchain.assembler(isaToGfx(isa), wavefrontsize, str(asmPath), str(asmPath.with_suffix(".o")))
++        if asmPath.stat().st_size == 0:
++            print(f"Tensile::WARNING: Skipping empty assembly file: {asmPath}")
++            if removeTemporaries:
++                asmPath.unlink()
++            return result
++        try:
++            asmToolchain.assembler(isaToGfx(isa), wavefrontsize, str(asmPath), str(asmPath.with_suffix(".o")))
++        except RuntimeError as e:
++            printWarning(f"Assembly failed for {asmPath.name}, skipping: {str(e)[:200]}")
+         if removeTemporaries:
+             asmPath.unlink()
+         return result
+diff --git a/projects/hipblaslt/tensilelite/Tensile/Toolchain/Assembly.py b/projects/hipblaslt/tensilelite/Tensile/Toolchain/Assembly.py
+index a8b91e8d62..df0ad2c811 100644
+--- a/projects/hipblaslt/tensilelite/Tensile/Toolchain/Assembly.py
++++ b/projects/hipblaslt/tensilelite/Tensile/Toolchain/Assembly.py
+@@ -93,7 +93,13 @@ def buildAssemblyCodeObjectFiles(
+           coFileMap[asmDir / (coName + extCoRaw)].add(str(asmDir / (kernel["BaseName"] + extObj)))
+ 
+       for coFileRaw, objFiles in coFileMap.items():
+-        linker(objFiles, str(coFileRaw))
++        existingObjFiles = [f for f in objFiles if Path(f).exists()]
++        if not existingObjFiles:
++          continue
++        if len(existingObjFiles) < len(objFiles):
++          skipped = len(objFiles) - len(existingObjFiles)
++          print(f"Tensile::WARNING: Skipping {skipped} missing object file(s) for {coFileRaw.name}")
++        linker(existingObjFiles, str(coFileRaw))
+         coFile = destDir / coFileRaw.name.replace(extCoRaw, extCo)
+         if compress:
+           bundler.compress(str(coFileRaw), str(coFile), gfx)
+diff --git a/projects/hipblaslt/tensilelite/Tensile/Toolchain/Source.py b/projects/hipblaslt/tensilelite/Tensile/Toolchain/Source.py
+index 778381af99..0814037ff5 100644
+--- a/projects/hipblaslt/tensilelite/Tensile/Toolchain/Source.py
++++ b/projects/hipblaslt/tensilelite/Tensile/Toolchain/Source.py
+@@ -58,6 +58,7 @@ def _computeSourceCodeObjectFilename(target: str, base: str, buildPath: Union[Pa
+     """
+     coPath = None
+     buildPath = Path(buildPath)
++
+     if "TensileLibrary" in base and "fallback" in base:
+         coPath = buildPath / "{0}_{1}.hsaco.raw".format(base, arch)
+     elif "TensileLibrary" in base:
+@@ -66,7 +67,7 @@ def _computeSourceCodeObjectFilename(target: str, base: str, buildPath: Union[Pa
+         if arch in baseVariant:
+             coPath = buildPath / (baseVariant + ".hsaco.raw")
+     else:
+-        coPath= buildPath / "{0}.so-000-{1}.hsaco.raw".format(base, arch)
++        coPath = buildPath / "{0}.so-000-{1}.hsaco.raw".format(base, arch)
+ 
+     return coPath
+ 
+@@ -123,6 +124,14 @@ def buildSourceCodeObjectFiles(
+     with timing_context("python_kernel_build_src_co.move"):
+         for src, dst in zip(coPathsRaw, coPaths):
+             shutil.move(src, dst)
++            # Runtime may request helper hsaco without target-feature suffix while
++            # toolchain emits feature-qualified names (e.g. gfx950-xnack+). Keep an
++            # unsuffixed alias so lazy-loading dependencies resolve consistently.
++            alias = re.sub(r"((?:\.so-000-)(gfx[0-9a-f]+))-(?:xnack[+-]|sramecc[+-])(\.hsaco)$",
++                           r"\1\3",
++                           dst)
++            if alias != dst and not Path(alias).exists():
++                shutil.copy2(dst, alias)
+ 
+     stop = timer()
+     print1(f"buildSourceCodeObjectFile time (s): {(stop-start):3.2f}")
+diff --git a/projects/hipblaslt/tensilelite/client/include/Rotating.hpp b/projects/hipblaslt/tensilelite/client/include/Rotating.hpp
+index c262fefd85..0baba5ba1f 100644
+--- a/projects/hipblaslt/tensilelite/client/include/Rotating.hpp
++++ b/projects/hipblaslt/tensilelite/client/include/Rotating.hpp
+@@ -49,6 +49,7 @@ namespace TensileLite
+         explicit RotatingMemory(size_t num) : m_rotatingBufferNum(num) {}
+         ~RotatingMemory() {}
+         void addRotatingSize(std::vector<size_t> sizes);
++        void ensureMinRotatingSize(size_t tensorIdx, size_t minBytes);
+         void createRotatingMemory(int32_t mode, size_t rotatingSize);
+         std::vector<std::vector<RotatingMemoryUnit>> getRotatingMemory() const;
+         std::shared_ptr<void> getData() const;
+diff --git a/projects/hipblaslt/tensilelite/client/src/BenchmarkTimer.cpp b/projects/hipblaslt/tensilelite/client/src/BenchmarkTimer.cpp
+index 59a1f6fb69..6af5b44c75 100644
+--- a/projects/hipblaslt/tensilelite/client/src/BenchmarkTimer.cpp
++++ b/projects/hipblaslt/tensilelite/client/src/BenchmarkTimer.cpp
+@@ -178,7 +178,9 @@ namespace TensileLite
+                 if(auto problem = dynamic_cast<ContractionProblemGroupedGemm*>(m_problem))
+                 {
+                     pp        = m_solution->projectedPerformance(problem->gemms[0], m_hardware);
+-                    flopCount = problem->gemms[0].flopCount();
++                    flopCount = 0.0;
++                    for(auto& gemm : problem->gemms)
++                        flopCount += gemm.flopCount();
+                 }
+                 else if(auto problem = dynamic_cast<ContractionProblemGemm*>(m_problem))
+                 {
+diff --git a/projects/hipblaslt/tensilelite/client/src/DataInitialization.cpp b/projects/hipblaslt/tensilelite/client/src/DataInitialization.cpp
+index 834446c0c4..64fd15eeeb 100644
+--- a/projects/hipblaslt/tensilelite/client/src/DataInitialization.cpp
++++ b/projects/hipblaslt/tensilelite/client/src/DataInitialization.cpp
+@@ -885,7 +885,7 @@ namespace TensileLite
+ 
+         {
+             m_rotatingBuffer
+-                = args["rotating-buffer-size"].as<int32_t>() * 1024 * 1024; // Change to bytes
++                = static_cast<int64_t>(args["rotating-buffer-size"].as<int32_t>()) * 1024 * 1024; // Change to bytes
+             m_rotatingMode   = args["rotating-buffer-mode"].as<int32_t>();
+             m_boundsCheck    = args["bounds-check"].as<BoundsCheckMode>();
+             m_curBoundsCheck = m_boundsCheck;
+@@ -1208,6 +1208,22 @@ namespace TensileLite
+                           << ToString(m_vdata[i].init) << std::endl;
+             }
+ 
++            // Sync rotating memory sizes with inflated maxElements (bounds-check
++            // rounding may have enlarged maxElements beyond what was originally
++            // registered with addRotatingSize)
++            if(m_rotatingBuffer > 0 && m_rm)
++            {
++                for(size_t i = 0; i < m_vdata.size(); i++)
++                {
++                    for(auto& p : m_vdata[i].pristine)
++                    {
++                        size_t neededBytes
++                            = DataTypeInfo::Get(p.first).elementSize * p.second.maxElements;
++                        m_rm->ensureMinRotatingSize(i, neededBytes);
++                    }
++                }
++            }
++
+             // Init contants
+             for(size_t i = 0; i < m_cdata.size(); i++)
+             {
+@@ -2504,21 +2520,21 @@ namespace TensileLite
+             {
+                 auto    castInputs   = static_pointer_cast<ContractionInputs>(inputs);
+                 size_t  rotatingSize = getRotatingSize(*gemmProblem, *castInputs);
+-                int32_t rotatingNum
++                int64_t rotatingNum
+                     = min(maxRotatingBufferNum, ceil((float)m_rotatingBuffer / rotatingSize))
+                       - 1; // Minus the original buffer.
+ 
+                 // <= 0 means don't rotating
+-                rotatingNum = max(0, rotatingNum);
++                rotatingNum = max((int64_t)0, rotatingNum);
+ 
+-                int32_t totalRotatingSizeNeeded = rotatingNum * rotatingSize;
++                int64_t totalRotatingSizeNeeded = rotatingNum * rotatingSize;
+                 std::cout << "Rotating buffer set to: " << m_rotatingBuffer
+                           << ". Rotating num: " << rotatingNum << std::endl;
+                 if(m_rotatingMode == 0)
+                 {
+                     auto rotatingAllocatedSize
+                         = m_rm->getDataSize() - m_rm->getDataLargestUnitSize();
+-                    if(totalRotatingSizeNeeded > rotatingAllocatedSize)
++                    if(totalRotatingSizeNeeded > (int64_t)rotatingAllocatedSize)
+                     {
+                         std::cout << "Rotating buffer size: " << rotatingAllocatedSize
+                                   << " is not enough for rotating buffer size: " << rotatingSize
+@@ -2566,21 +2582,21 @@ namespace TensileLite
+                     rotatingSize
+                         += getRotatingSize(groupedProblem->gemms[i], castInputs->grouped[i]);
+                 }
+-                int32_t rotatingNum
++                int64_t rotatingNum
+                     = min(maxRotatingBufferNum, ceil((float)m_rotatingBuffer / rotatingSize))
+                       - 1; // Minus the original buffer.
+ 
+                 // <= 0 means don't rotating
+-                rotatingNum = max(0, rotatingNum);
++                rotatingNum = max((int64_t)0, rotatingNum);
+ 
+-                int32_t totalRotatingSizeNeeded = rotatingNum * rotatingSize;
++                int64_t totalRotatingSizeNeeded = rotatingNum * rotatingSize;
+                 std::cout << "Rotating buffer set to: " << m_rotatingBuffer
+                           << ". Rotating num: " << rotatingNum << std::endl;
+                 if(m_rotatingMode == 0)
+                 {
+                     auto rotatingAllocatedSize
+                         = m_rm->getDataSize() - m_rm->getDataLargestUnitSize();
+-                    if(totalRotatingSizeNeeded > rotatingAllocatedSize)
++                    if(totalRotatingSizeNeeded > (int64_t)rotatingAllocatedSize)
+                     {
+                         std::cout << "Rotating buffer size: " << rotatingAllocatedSize
+                                   << " is not enough for rotating buffer size: " << rotatingSize
+diff --git a/projects/hipblaslt/tensilelite/client/src/ProgressListener.cpp b/projects/hipblaslt/tensilelite/client/src/ProgressListener.cpp
+index 9a5524c59a..cdc9e74775 100644
+--- a/projects/hipblaslt/tensilelite/client/src/ProgressListener.cpp
++++ b/projects/hipblaslt/tensilelite/client/src/ProgressListener.cpp
+@@ -100,6 +100,10 @@ namespace TensileLite
+             if(auto groupedProblem = dynamic_cast<const ContractionProblemGroupedGemm*>(problem))
+             {
+                 writeReport(groupedProblem->gemms[0]);
++                double totalFlops = 0.0;
++                for(auto& it : groupedProblem->gemms)
++                    totalFlops += it.flopCount();
++                m_reporter->report(ResultKey::TotalFlops, totalFlops);
+                 std::vector<std::vector<size_t>> sizes;
+                 for(auto& it : groupedProblem->gemms)
+                     sizes.push_back(it.problemSizes());
+diff --git a/projects/hipblaslt/tensilelite/client/src/Rotating.cpp b/projects/hipblaslt/tensilelite/client/src/Rotating.cpp
+index e225b5d26c..29fc66244e 100644
+--- a/projects/hipblaslt/tensilelite/client/src/Rotating.cpp
++++ b/projects/hipblaslt/tensilelite/client/src/Rotating.cpp
+@@ -29,6 +29,8 @@
+ #include <hip/hip_runtime.h>
+ #include <iostream>
+ #include <math.h>
++#include <sstream>
++#include <stdexcept>
+ 
+ namespace TensileLite
+ {
+@@ -46,6 +48,19 @@ namespace TensileLite
+         m_rotatingInfo.push_back(RotatingUnitInfo{sizes, totalSize, 0});
+     }
+ 
++    void RotatingMemory::ensureMinRotatingSize(size_t tensorIdx, size_t minBytes)
++    {
++        for(auto& info : m_rotatingInfo)
++        {
++            if(tensorIdx < info.sizes.size() && info.sizes[tensorIdx] > 0
++               && info.sizes[tensorIdx] < minBytes)
++            {
++                info.totalSize += (minBytes - info.sizes[tensorIdx]);
++                info.sizes[tensorIdx] = minBytes;
++            }
++        }
++    }
++
+     void RotatingMemory::createRotatingMemory(int32_t mode, size_t rotatingSize)
+     {
+         // Check how many rotating units are needed
+@@ -111,8 +126,16 @@ namespace TensileLite
+         m_size = totalSize;
+         m_largestUnitSize = largestUnitSize;
+ 
+-        void* ptr   = nullptr;
+-        static_cast<void>(hipMalloc(&ptr, totalSize));
++        void*      ptr = nullptr;
++        hipError_t err = hipMalloc(&ptr, totalSize);
++        if(err != hipSuccess || ptr == nullptr)
++        {
++            std::ostringstream msg;
++            msg << "Failed to allocate rotating memory: " << totalSize
++                << " bytes (" << (totalSize / (1024.0 * 1024.0)) << " MB). "
++                << "hipMalloc returned " << hipGetErrorString(err);
++            throw std::runtime_error(msg.str());
++        }
+         m_data = std::shared_ptr<void>(ptr, hipFree);
+         std::cout << "Rotating memory size: " << totalSize << std::endl;
+ 
