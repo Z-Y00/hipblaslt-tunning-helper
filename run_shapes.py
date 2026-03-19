@@ -81,6 +81,7 @@ _GFX950_LLC_MB = 256
 _MIN_ROTATIONS = 5
 _MAX_ROTATING_MB = 8192
 _FP8_ROTATION_SCALE = 5
+_TENSILE_OVERHEAD_FACTOR = 1.25  # Tensile client reserves ~15-17% for alignment/metadata
 
 
 def compute_rotating_buffer_mb(M, N, K, dtype="bf16"):
@@ -92,6 +93,7 @@ def compute_rotating_buffer_mb(M, N, K, dtype="bf16"):
     if tensor_set_mb >= _GFX950_LLC_MB * 2:
         return 0
     needed_mb = max(tensor_set_mb * _MIN_ROTATIONS * scale, _GFX950_LLC_MB * 2)
+    needed_mb *= _TENSILE_OVERHEAD_FACTOR
     return min(int(math.ceil(needed_mb)), _MAX_ROTATING_MB)
 
 
@@ -705,16 +707,22 @@ def _parse_hipblaslt_output(output):
 # ---------------------------------------------------------------------------
 
 def run_api_bench(M, N, K, trans_a=True, trans_b=False,
-                  device=None, warmup=30, iters=50):
+                  device=None, warmup=30, iters=50, rotating_mb=None,
+                  dtype="bf16"):
     """Run test_hipblaslt_api in single-shape CSV mode.
 
-    Uses Tensile-exact timing (single event pair, total/N average,
-    random [-3,3] init, no rotating buffers) so its TFLOPS aligns
-    with Tensile's reported numbers.
+    Uses Tensile-aligned timing (single event pair, total/N average,
+    random [-3,3] init).  When rotating_mb is None (default), the
+    rotating buffer size is computed automatically via
+    compute_rotating_buffer_mb() to match Tensile's cold-cache behavior.
+    Pass rotating_mb=0 to force warm L2.
     """
     if not Path(API_BENCH).exists():
         print(f"  api-bench: SKIPPED (binary not found at {API_BENCH})")
         return None
+
+    if rotating_mb is None:
+        rotating_mb = compute_rotating_buffer_mb(M, N, K, dtype=dtype)
 
     ta = "T" if trans_a else "N"
     tb = "T" if trans_b else "N"
@@ -723,6 +731,7 @@ def run_api_bench(M, N, K, trans_a=True, trans_b=False,
         "-m", str(M), "-n", str(N), "-k", str(K),
         "--transA", ta, "--transB", tb,
         "--warmup", str(warmup), "--iters", str(iters),
+        "--rotating", str(rotating_mb),
         "--csv",
     ]
     env = None
@@ -732,7 +741,9 @@ def run_api_bench(M, N, K, trans_a=True, trans_b=False,
         env["CUDA_VISIBLE_DEVICES"] = str(device)
         cmd += ["--device", "0"]
 
-    print(f"  api-bench: running ...", end="", flush=True)
+    cache_label = "cold" if rotating_mb > 0 else "warm"
+    print(f"  api-bench: running (rotating={rotating_mb} MB, {cache_label} L2) ...",
+          end="", flush=True)
     try:
         result = subprocess.run(cmd, capture_output=True, text=True,
                                 timeout=120, env=env)
@@ -745,7 +756,8 @@ def run_api_bench(M, N, K, trans_a=True, trans_b=False,
         avg_us = float(parts[0])
         tflops = float(parts[1])
         kernel = parts[2] if len(parts) > 2 else ""
-        print(f"\r  api-bench: {tflops:.1f} TFLOPS  ({avg_us:.1f} µs){' '*10}")
+        print(f"\r  api-bench: {tflops:.1f} TFLOPS  ({avg_us:.1f} µs, "
+              f"rotating={rotating_mb} MB){' '*10}")
         return {"tflops": tflops, "time_us": avg_us, "kernel_name": kernel}
     except (subprocess.TimeoutExpired, Exception) as e:
         print(f"\r  api-bench: ERROR ({e}){' '*20}")
@@ -1100,13 +1112,13 @@ def _process_one_shape(shape, idx, total, header, footer, out_dir, args, device)
             trans_b=shape.get("trans_b", False),
             device=device, dtype=dtype,
         )
-        # API bench: same col-major dims, Tensile-aligned timing
+        # API bench: same col-major dims, Tensile-aligned timing + rotating
         if dtype == "bf16":
             api_result = run_api_bench(
                 shape["N"], shape["M"], shape["K"],
                 trans_a=shape.get("trans_a", True),
                 trans_b=shape.get("trans_b", False),
-                device=device,
+                device=device, dtype=dtype,
             )
 
     row = {

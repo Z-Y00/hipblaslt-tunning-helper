@@ -27,7 +27,7 @@ echo "Log: $LOG"
 nohup python3 run_shapes.py \
     --run \
     --parallel 8 \
-    --origami-top-n 30 \
+    --origami-top-n 10 \
     "$@" \
     > "$LOG" 2>&1 &
 

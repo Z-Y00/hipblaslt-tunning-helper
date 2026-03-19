@@ -132,7 +132,7 @@ num-syncs-per-benchmark=1    # 1 batch per benchmark run
 use-gpu-timer=True           # GPU event timing (not host clock)
 num-warmups=30               # warmups before timed run
 icache-flush-args=False      # no icache flush (flushTimeUs=0)
-rotating-buffer-size=0       # NO rotating buffers in Tensile!
+rotating-buffer-size=0       # Template default; overridden per-shape by run_shapes.py
 ```
 
 ### Exact Timing Flow
@@ -180,7 +180,51 @@ rotating-buffer-size=0       # NO rotating buffers in Tensile!
 - **Average (total/N)**: NOT best-of-N or median — just total time / 50
 - **Inter-kernel gaps included**: The single event pair captures wall-clock GPU time
   including any micro-gaps between consecutive kernel executions
-- **No rotating buffers**: `rotating-buffer-size=0` in all tuning configs
+
+### Rotating Buffer Behavior (Source-Verified)
+
+**CORRECTION**: Earlier notes stated `rotating-buffer-size=0` in all tuning configs.
+This was true for the *template default*, but `run_shapes.py` **overrides** the YAML
+`RotatingBufferSize` per-shape via `compute_rotating_buffer_mb()`, so the generated
+`ClientParameters.ini` gets a non-zero value for shapes that fit in cache.
+
+The Tensile client **does** cycle through different buffer pointers during the timed
+loop.  Source: `client/main.cpp` lines 1076–1203:
+
+1. `prepareRotatingGPUOutput()` creates N copies of input buffers (A, B, C, D, etc.)
+   in separate GPU memory regions, where N = `min(maxEnqueues, ceil(rotBufSize/tensorSetSize)) - 1`.
+2. `solution->solve(*problem, *inputArr[r], ...)` is called for each copy,
+   producing `kernels[r]` with **different buffer pointers baked in**.
+3. The timed inner loop uses `kIdx = ((i * enq) + j) % kernels.size()`, so each
+   of the 50 enqueues hits a **different memory address set** → L2 cache is cold.
+
+When `RotatingBufferSize=0` (or tensor_set >= 2×LLC), `inputArr` has only 1 entry,
+`kIdx` is always 0, and all enqueues hit the **same pointers** → warm L2.
+
+### `compute_rotating_buffer_mb()` Logic (run_shapes.py)
+
+```
+LLC = 256 MB (gfx950)
+tensor_set = (M*K + K*N) * elem_bytes + 2 * M*N * 2   # A + B + C + D
+if tensor_set >= 512 MB:   return 0                     # too big, skip rotation
+else: return min(max(tensor_set * 5, 512 MB), 8192 MB)  # ≥5 rotations or ≥2×LLC
+```
+
+Note: the formula counts only A, B, C, D — it does **not** include bias or
+scaleAlphaVec.  This means the actual memory footprint per rotation may be slightly
+larger than estimated.
+
+### Three Benchmark Drivers and Their Cache Behavior
+
+| Driver          | Rotating buffer                  | Cache state     | Purpose                          |
+|-----------------|----------------------------------|-----------------|----------------------------------|
+| Tensile client  | `compute_rotating_buffer_mb()`   | Cold L2 (if >0) | Tune under realistic conditions  |
+| hipblaslt-bench | Same `compute_rotating_buffer_mb()` | Cold L2 (if >0) | Fair comparison, same methodology |
+| API bench       | Same `compute_rotating_buffer_mb()` | Cold L2 (if >0) | Verify hipblasLtMatmul matches Tensile |
+
+The API bench (`test_hipblaslt_api`) accepts `--rotating <MB>` and cycles through
+multiple buffer copies, just like the Tensile client.  `run_shapes.py` automatically
+passes the same `compute_rotating_buffer_mb()` value to all three drivers.
 
 ### Why hipBLASLt API Calls Measure Differently
 
@@ -191,12 +235,10 @@ higher TFLOPS than Tensile because:
    lower time than total/N average
 2. **Per-call events exclude inter-kernel gaps**: Individual event pairs measure
    only kernel execution time, while Tensile's single pair includes dispatch gaps
-3. **`rotating-buffer-size=0` in Tensile** means warm L2 cache — but per-call
-   events in the driver can still show different variance characteristics
 
 To reproduce Tensile's numbers exactly: use ONE event pair around all N enqueues,
 divide total elapsed time by N, use `hipExtModuleLaunchKernel` directly (not
-`hipblasLtMatmul`), and use `rotating-buffer-size=0`.
+`hipblasLtMatmul`), and match the same rotating-buffer-size.
 
 ## Measurement Bias: Tensile Client vs hipblaslt-bench
 
@@ -228,6 +270,58 @@ The gap **is** caused by:
 The gate in `rebuild_hipblaslt.sh` compares `tensile_tflops / bench_tflops`.
 Due to the ~12% tool bias, this ratio is always inflated — a kernel with ZERO
 actual improvement will show T/B ≈ 1.12.
+
+## T/A Ratio (Tensile vs API bench) — What It Tells You
+
+The T/A ratio = `Tensile TFLOPS / API TFLOPS`.  It compares the Tensile client's
+reported winner performance against `test_hipblaslt_api` which calls `hipblasLtMatmul`
+with Tensile-aligned timing (single event pair, total/N average, random init, and
+the **same** rotating buffer size as Tensile).
+
+Both drivers now use the same cache conditions, so T/A should converge:
+
+- **T/A ≈ 96–105%**: Tensile and API agree under identical cache conditions.
+  These are trustworthy results.
+- **T/A >> 110%**: Suspect.  Tensile reports much higher than API can reproduce.
+  Common causes:
+  1. hipBLASLt heuristic selects a **different kernel** than Tensile's tuned winner
+  2. The tuned kernel's AOT-compiled variant behaves differently than Tensile's JIT
+  3. GPU contention during the API bench run
+
+### Patterns from BF16 Tuning (Llama-2-7B + Llama-2-70B, gfx950)
+
+From the `.report.md` files (see warning below):
+
+- **75% of shapes** have T/A 85–110% — trustworthy
+- **25% of shapes** have T/A > 110% — hipBLASLt heuristic picks a worse kernel
+
+**After re-verification** (single-GPU, idle, matching rotating buffers), 44 of 57
+"suspect" shapes collapsed to healthy 85–105% T/A — the original high ratios were
+logging artifacts from parallel interleaving (see warning below).
+
+Only **4 `attn_k` shapes remain mildly elevated (111–119%)**:
+  - These are small/skinny shapes with K=1024 or M=1024.
+  - Tensile's tuned kernel genuinely outperforms the hipBLASLt heuristic's pick.
+  - This is **expected** and exactly what tuning is for — the whole point is to find
+    better kernels for shapes where the library's heuristic falls short.
+  - hipblaslt-bench confirms the same gap, so it is a library kernel selection issue,
+    not a measurement error.
+
+### WARNING: Do NOT parse T/A ratios from the parallel tuning log
+
+When `run_shapes.py` runs with `--parallel N` (N > 1), the log output from
+multiple threads is **interleaved**.  The `>> Tensile=X | API=Y` summary lines
+in the log can be **misattributed** — a summary line may appear under a different
+shape's header because thread output is interleaved by the print lock.
+
+**Always use the `.report.md` files** in `tunning_results/bf16/<shape_id>.report.md`
+for per-shape results.  These are written atomically per thread and contain the
+correct Tensile, API, and Bench TFLOPS for each shape.
+
+Cross-GPU contention (Tensile running on other GPUs) does **not** affect
+single-GPU GEMM performance on MI300.  Each GCD has independent HBM and compute.
+Bad T/A numbers in the log are from misattributed interleaved output, not from
+contention.
 
 ## GPU Contention Warning
 
@@ -340,7 +434,10 @@ To reproduce Tensile's reported TFLOPS through the hipBLASLt API:
 2. **Single event pair**: `hipEventRecord(start)` before all enqueues,
    `hipEventRecord(stop)` after all enqueues — NOT per-call events
 3. **Average timing**: `total_time / num_enqueues` — NOT best-of-N
-4. **No rotating buffers**: `rotating-buffer-size=0`
+4. **Matching rotating buffer**: Use the same `rotating-buffer-size` that Tensile
+   used (check `ClientParameters.ini` or `compute_rotating_buffer_mb()` output).
+   For shapes where RotBuf>0, you must also cycle through separate allocations to
+   reproduce cold-cache conditions.  If RotBuf=0, warm-cache is correct.
 5. **30 warmups, 50 timed enqueues**
 
 ### Results (API vs Tensile vs hipblaslt-bench)
@@ -356,8 +453,13 @@ With all parameters aligned, the API driver matches Tensile within 1-2%:
 | mlp_down 4096x14k  | 1783   |     1798  | 0.99x |    1629 | 1.09x |
 
 **Conclusion**: The installed tuned kernels deliver the Tensile-reported performance
-when called through `hipblasLtMatmul`. The ~10% gap vs `hipblaslt-bench` comes from
-`hipblaslt-bench`'s use of rotating buffers (cold L2 cache), not from kernel quality.
+when called through `hipblasLtMatmul` with matching cache conditions. The ~10% gap
+vs `hipblaslt-bench` comes from `hipblaslt-bench`'s use of rotating buffers
+(cold L2 cache), not from kernel quality.
+
+`run_shapes.py` dynamically injects the same `RotatingBufferSize` into all three
+drivers (Tensile YAML, `hipblaslt-bench --rotating`, `test_hipblaslt_api --rotating`)
+via `compute_rotating_buffer_mb()`, so all measure under identical cache conditions.
 
 ### Why attn_k (M=1024) Is an Outlier
 

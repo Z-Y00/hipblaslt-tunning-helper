@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -44,8 +45,13 @@ struct GemmResult {
     std::string kernel_name;
 };
 
-static GemmResult run_gemm(hipblasLtHandle_t handle, const GemmShape& s,
-                           int warmup, int iters, bool verbose) {
+struct RotatingBuffers {
+    std::vector<hip_bfloat16*> dA, dB, dC, dD;
+    int num_copies;
+};
+
+static RotatingBuffers alloc_rotating(const GemmShape& s, int rotating_mb,
+                                      int max_enqueues) {
     const int64_t m = s.m, n = s.n, k = s.k;
     const int64_t lda = (s.opA == HIPBLAS_OP_T) ? k : m;
     const int64_t ldb = (s.opB == HIPBLAS_OP_T) ? n : k;
@@ -59,27 +65,65 @@ static GemmResult run_gemm(hipblasLtHandle_t handle, const GemmShape& s,
     size_t bytesB = sizeB * sizeof(hip_bfloat16);
     size_t bytesC = sizeC * sizeof(hip_bfloat16);
     size_t bytesD = sizeD * sizeof(hip_bfloat16);
+    size_t tensor_set = bytesA + bytesB + bytesC + bytesD;
+
+    int num_copies = 1;
+    if (rotating_mb > 0 && tensor_set > 0) {
+        size_t rotating_bytes = (size_t)rotating_mb * 1024ULL * 1024ULL;
+        num_copies = std::max(2, std::min(max_enqueues,
+                              (int)(rotating_bytes / tensor_set)));
+    }
 
     auto fill_random_bf16 = [](hip_bfloat16* host, size_t count, unsigned seed) {
         std::mt19937 rng(seed);
         for (size_t i = 0; i < count; i++)
-            host[i] = static_cast<hip_bfloat16>(static_cast<float>((int)(rng() % 7) - 3));
+            host[i] = static_cast<hip_bfloat16>(
+                static_cast<float>((int)(rng() % 7) - 3));
     };
 
-    std::vector<hip_bfloat16> hA(sizeA), hB(sizeB), hC(sizeC);
-    fill_random_bf16(hA.data(), sizeA, 0);
-    fill_random_bf16(hB.data(), sizeB, 1);
-    fill_random_bf16(hC.data(), sizeC, 2);
+    RotatingBuffers rb;
+    rb.num_copies = num_copies;
+    rb.dA.resize(num_copies);
+    rb.dB.resize(num_copies);
+    rb.dC.resize(num_copies);
+    rb.dD.resize(num_copies);
 
-    hip_bfloat16 *dA, *dB, *dC, *dD;
-    HIP_CHECK(hipMalloc(&dA, bytesA));
-    HIP_CHECK(hipMalloc(&dB, bytesB));
-    HIP_CHECK(hipMalloc(&dC, bytesC));
-    HIP_CHECK(hipMalloc(&dD, bytesD));
-    HIP_CHECK(hipMemcpy(dA, hA.data(), bytesA, hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(dB, hB.data(), bytesB, hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(dC, hC.data(), bytesC, hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemset(dD, 0, bytesD));
+    for (int c = 0; c < num_copies; c++) {
+        std::vector<hip_bfloat16> hA(sizeA), hB(sizeB), hC(sizeC);
+        fill_random_bf16(hA.data(), sizeA, c * 4 + 0);
+        fill_random_bf16(hB.data(), sizeB, c * 4 + 1);
+        fill_random_bf16(hC.data(), sizeC, c * 4 + 2);
+
+        HIP_CHECK(hipMalloc(&rb.dA[c], bytesA));
+        HIP_CHECK(hipMalloc(&rb.dB[c], bytesB));
+        HIP_CHECK(hipMalloc(&rb.dC[c], bytesC));
+        HIP_CHECK(hipMalloc(&rb.dD[c], bytesD));
+        HIP_CHECK(hipMemcpy(rb.dA[c], hA.data(), bytesA, hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(rb.dB[c], hB.data(), bytesB, hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(rb.dC[c], hC.data(), bytesC, hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemset(rb.dD[c], 0, bytesD));
+    }
+    return rb;
+}
+
+static void free_rotating(RotatingBuffers& rb) {
+    for (int c = 0; c < rb.num_copies; c++) {
+        (void)hipFree(rb.dA[c]);
+        (void)hipFree(rb.dB[c]);
+        (void)hipFree(rb.dC[c]);
+        (void)hipFree(rb.dD[c]);
+    }
+}
+
+static GemmResult run_gemm(hipblasLtHandle_t handle, const GemmShape& s,
+                           int warmup, int iters, bool verbose,
+                           int rotating_mb = 0) {
+    const int64_t m = s.m, n = s.n, k = s.k;
+    const int64_t lda = (s.opA == HIPBLAS_OP_T) ? k : m;
+    const int64_t ldb = (s.opB == HIPBLAS_OP_T) ? n : k;
+    const int64_t ldc = m, ldd = m;
+
+    RotatingBuffers rb = alloc_rotating(s, rotating_mb, iters);
 
     hipblasLtMatmulDesc_t matmulDesc;
     HIPBLASLT_CHECK(hipblasLtMatmulDescCreate(&matmulDesc,
@@ -120,7 +164,7 @@ static GemmResult run_gemm(hipblasLtHandle_t handle, const GemmShape& s,
 
     if (returnCount == 0) {
         fprintf(stderr, "No algorithms found for %s!\n", s.name);
-        hipFree(dA); hipFree(dB); hipFree(dC); hipFree(dD);
+        free_rotating(rb);
         hipblasLtMatmulDescDestroy(matmulDesc);
         hipblasLtMatrixLayoutDestroy(layoutA);
         hipblasLtMatrixLayoutDestroy(layoutB);
@@ -142,9 +186,10 @@ static GemmResult run_gemm(hipblasLtHandle_t handle, const GemmShape& s,
     HIP_CHECK(hipStreamCreate(&stream));
 
     for (int i = 0; i < warmup; i++) {
+        int idx = i % rb.num_copies;
         HIPBLASLT_CHECK(hipblasLtMatmul(handle, matmulDesc,
-                        &alpha, dA, layoutA, dB, layoutB,
-                        &beta, dC, layoutC, dD, layoutD,
+                        &alpha, rb.dA[idx], layoutA, rb.dB[idx], layoutB,
+                        &beta, rb.dC[idx], layoutC, rb.dD[idx], layoutD,
                         &results[0].algo, workspace, wsSize, stream));
     }
     HIP_CHECK(hipStreamSynchronize(stream));
@@ -156,9 +201,10 @@ static GemmResult run_gemm(hipblasLtHandle_t handle, const GemmShape& s,
 
     HIP_CHECK(hipEventRecord(ev_start, stream));
     for (int j = 0; j < iters; j++) {
+        int idx = j % rb.num_copies;
         HIPBLASLT_CHECK(hipblasLtMatmul(handle, matmulDesc,
-                        &alpha, dA, layoutA, dB, layoutB,
-                        &beta, dC, layoutC, dD, layoutD,
+                        &alpha, rb.dA[idx], layoutA, rb.dB[idx], layoutB,
+                        &beta, rb.dC[idx], layoutC, rb.dD[idx], layoutD,
                         &results[0].algo, workspace, wsSize, stream));
     }
     HIP_CHECK(hipEventRecord(ev_stop, stream));
@@ -173,8 +219,8 @@ static GemmResult run_gemm(hipblasLtHandle_t handle, const GemmShape& s,
     HIP_CHECK(hipEventDestroy(ev_start));
     HIP_CHECK(hipEventDestroy(ev_stop));
     HIP_CHECK(hipStreamDestroy(stream));
-    if (workspace) hipFree(workspace);
-    hipFree(dA); hipFree(dB); hipFree(dC); hipFree(dD);
+    if (workspace) (void)hipFree(workspace);
+    free_rotating(rb);
     hipblasLtMatmulDescDestroy(matmulDesc);
     hipblasLtMatrixLayoutDestroy(layoutA);
     hipblasLtMatrixLayoutDestroy(layoutB);
@@ -192,15 +238,19 @@ static void usage() {
         "    -m M -n N -k K [--transA T|N] [--transB T|N]\n"
         "  Multi-shape mode (hardcoded demo shapes, no -m/-n/-k)\n"
         "\n"
-        "  --device D     GPU device index (default 0)\n"
-        "  --warmup W     Warmup iterations (default 30)\n"
-        "  --iters I      Timed iterations (default 50)\n"
-        "  --csv          Machine-readable output: avg_us,tflops,kernel_name\n"
+        "  --device D       GPU device index (default 0)\n"
+        "  --warmup W       Warmup iterations (default 30)\n"
+        "  --iters I        Timed iterations (default 50)\n"
+        "  --rotating MB    Rotating buffer size in MB (default 0 = warm L2).\n"
+        "                   When >0, allocates multiple buffer copies and\n"
+        "                   cycles through them to flush L2 (cold cache),\n"
+        "                   matching Tensile client behavior.\n"
+        "  --csv            Machine-readable output: avg_us,tflops,kernel_name\n"
     );
 }
 
 int main(int argc, char** argv) {
-    int device = 0, warmup = 30, iters = 50;
+    int device = 0, warmup = 30, iters = 50, rotating_mb = 0;
     int64_t cli_m = 0, cli_n = 0, cli_k = 0;
     char cli_transA = 'T', cli_transB = 'N';
     bool csv_mode = false;
@@ -209,6 +259,7 @@ int main(int argc, char** argv) {
         if (strcmp(argv[i], "--device") == 0 && i+1 < argc) device = atoi(argv[++i]);
         else if (strcmp(argv[i], "--warmup") == 0 && i+1 < argc) warmup = atoi(argv[++i]);
         else if (strcmp(argv[i], "--iters") == 0 && i+1 < argc) iters = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--rotating") == 0 && i+1 < argc) rotating_mb = atoi(argv[++i]);
         else if (strcmp(argv[i], "-m") == 0 && i+1 < argc) cli_m = atoll(argv[++i]);
         else if (strcmp(argv[i], "-n") == 0 && i+1 < argc) cli_n = atoll(argv[++i]);
         else if (strcmp(argv[i], "-k") == 0 && i+1 < argc) cli_k = atoll(argv[++i]);
@@ -230,20 +281,22 @@ int main(int argc, char** argv) {
         hipblasOperation_t opA = (cli_transA == 'T') ? HIPBLAS_OP_T : HIPBLAS_OP_N;
         hipblasOperation_t opB = (cli_transB == 'T') ? HIPBLAS_OP_T : HIPBLAS_OP_N;
         GemmShape s = {"cli", cli_m, cli_n, cli_k, opA, opB, 0, 0};
-        auto r = run_gemm(handle, s, warmup, iters, !csv_mode);
+        auto r = run_gemm(handle, s, warmup, iters, !csv_mode, rotating_mb);
         if (csv_mode) {
             printf("%.3f,%.4f,%s\n", r.avg_us, r.avg_tflops, r.kernel_name.c_str());
         } else {
-            printf("m=%ld n=%ld k=%ld transA=%c transB=%c | avg %.1f us  %.1f TFLOPS\n",
+            printf("m=%ld n=%ld k=%ld transA=%c transB=%c rotating=%d MB | "
+                   "avg %.1f us  %.1f TFLOPS\n",
                    (long)cli_m, (long)cli_n, (long)cli_k, cli_transA, cli_transB,
-                   r.avg_us, r.avg_tflops);
+                   rotating_mb, r.avg_us, r.avg_tflops);
             printf("kernel: %s\n", r.kernel_name.c_str());
         }
     } else {
         hipDeviceProp_t props;
         HIP_CHECK(hipGetDeviceProperties(&props, device));
         printf("Device %d: %s\n", device, props.name);
-        printf("Warmup: %d, Iters: %d\n\n", warmup, iters);
+        printf("Warmup: %d, Iters: %d, Rotating: %d MB\n\n",
+               warmup, iters, rotating_mb);
 
         GemmShape shapes[] = {
             {"attn_k(M8192_N1024_K4096)",
@@ -260,14 +313,16 @@ int main(int argc, char** argv) {
              4096, 8192, 14336, HIPBLAS_OP_T, HIPBLAS_OP_N, 1797.47, 1629.03},
         };
 
-        printf("  Tensile-exact: %d warmup, %d enqueues (1 event pair), rotating=0\n\n",
-               warmup, iters);
+        const char* cache_label = (rotating_mb > 0) ? "cold L2" : "warm L2";
+        printf("  Tensile-aligned: %d warmup, %d enqueues (1 event pair), "
+               "rotating=%d MB (%s)\n\n",
+               warmup, iters, rotating_mb, cache_label);
         printf("  %-36s %5s %5s %5s   %18s   %10s %10s\n",
                "Shape", "m", "n", "k", "avg us / TF", "Tensile", "Bench");
         printf("%s\n", std::string(120, '-').c_str());
 
         for (auto& s : shapes) {
-            auto r = run_gemm(handle, s, warmup, iters, false);
+            auto r = run_gemm(handle, s, warmup, iters, false, rotating_mb);
             printf("  %-36s m=%5ld n=%5ld k=%5ld | avg %7.1f us  %7.1f TF | "
                    "Tensile=%7.1f  Bench=%7.1f\n",
                    s.name, (long)s.m, (long)s.n, (long)s.k,
