@@ -636,6 +636,9 @@ def run_hipblaslt_bench(M, N, K, trans_a=True, trans_b=False,
         "-i", str(iters),
         "-j", "30",
         "--rotating", str(rot_mb),
+        "--use_gpu_timer",
+        "--flush",
+        "--initialization", "trig_float",
         "--print_kernel_info",
     ]
     bench_env = None

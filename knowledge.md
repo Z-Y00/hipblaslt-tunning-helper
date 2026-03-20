@@ -566,6 +566,25 @@ except very small ones (N=1024) where the tile size doesn't benefit from it.
 identical split between Tensile and API. Neither parameter is a source of
 T/A mismatch.
 
+### StaggerU — Memory Channel Conflict Avoidance
+
+StaggerU offsets each workgroup's starting position along the K dimension to
+avoid DRAM bank/channel conflicts when matrix dimensions are large powers of 2.
+Without it, all workgroups load from addresses separated by exact power-of-2
+strides, causing hot memory channels and TLB thrashing.
+
+- `StaggerU`: max stagger "clicks" (0=disabled, 4=up to 4 offsets per WG)
+- `StaggerUStride`: bytes per click (256 = one MI300X memory channel width)
+- `StaggerUMapping`: which WG dimension determines offset (0=wg0, 1=wg1)
+
+The production hipBLASLt library (`gfx950_Cijk_*_UserArgs.yaml`) uses
+`StaggerUStride` values of 0, 64, 128, and 256 across different kernels.
+Our templates now match: `StaggerU: [0, 4]`, `StaggerUStride: [0, 64, 128, 256]`.
+
+Previously we had `StaggerU: [0]` (disabled) with `StaggerUStride: [16]` — this
+missed the entire staggering optimization. For LLM GEMMs with dimensions like
+8192, 16384, 32768, this could be significant.
+
 ### Tensile Client vs hipblasLtMatmul Dispatch Gap (~7%)
 
 **Critical finding**: The exact same kernel binary shows ~7% lower TFLOPS when
@@ -593,3 +612,52 @@ The smallest shape `attn_k` (M8192_N1024_K4096) shows 785 TF via API vs 1223 TF
 from Tensile. This is likely due to the hipBLASLt heuristic selecting a different
 (suboptimal) kernel than Tensile's tuned winner for this shape, or the AOT-compiled
 variant behaving differently at this small tile occupancy.
+
+## Production Library Kernel Parameter Distribution (gfx950)
+
+Analyzed via `analyze_production_library.py`. Total kernels: **6,325**.
+
+```
+Field                          Unique  Values (% of kernels)
+====================================================================================================
+MatrixInstruction                   9  [16,16,32,1](67%)  [16,16,128,1](13%)  [32,32,16,1](11%)  [32,32,64,1](5%)  [16,16,4,1](3%)  +4 more
+DepthU                              8  64(41%)  128(31%)  32(15%)  256(9%)  16(2%)  512(2%)  +2 more
+TransposeLDS                        3  1(66%)  2(21%)  0(14%)
+DirectToLdsA                        2  false(55%)  true(45%)
+DirectToLdsB                        2  false(55%)  true(45%)
+NonTemporalA                        8  0(36%)  4(15%)  1(14%)  2(11%)  3(11%)  5(5%)  +2 more
+NonTemporalB                        8  0(40%)  1(15%)  2(12%)  3(12%)  4(12%)  5(3%)  +2 more
+NonTemporalD                        8  4(26%)  0(24%)  5(10%)  2(9%)  7(8%)  3(8%)  +2 more
+StaggerU                            4  0(56%)  8(27%)  16(16%)  32(0%)
+StaggerUStride                      7  0(56%)  128(17%)  256(13%)  512(12%)  64(1%)  1024(1%)  +1 more
+StaggerUMapping                     2  1(60%)  0(40%)
+WorkGroupMappingXCC                 7  1(27%)  8(25%)  2(15%)  4(15%)  16(10%)  32(7%)  +1 more
+GlobalSplitU                        3  0(99%)  1(1%)  6(0%)
+GlobalSplitUAlgorithm               1  MultipleBuffer(100%)
+StreamK                             2  3(99%)  0(1%)
+SourceSwap                          4  1(90%)  0(10%)
+PreloadKernArgs                     2  true(100%)
+ClusterLocalRead                    4  0(61%)  1(38%)
+PrefetchGlobalRead                  5  2(94%)  1(5%)  4(1%)  3(1%)
+PrefetchLocalRead                   2  1(83%)  0(17%)
+ScheduleIterAlg                     2  3(100%)
+1LDSBuffer                  (not in scan — see separate analysis: 1=70%, 0=30%)
+```
+
+### Key Gaps Between Our Template and Production
+
+| Parameter | Our template | Production | Impact |
+|-----------|-------------|-----------|--------|
+| DepthU | [32, 64] | 8 values (16–1024) | Missing 128, 256 (40% of prod kernels) |
+| StaggerU | [0, 4] | [0, 8, 16, 32] | Prod uses 8/16, not 4 |
+| StaggerUStride | [0, 64, 128, 256] | +512, 1024, 2048 | Missing larger strides |
+| NonTemporalA | not explored | 8 values (0–7) | 64% of prod uses NTA>0 |
+| NonTemporalD | [0, 4] | 8 values (0–7) | Only covers 50% of prod |
+| WorkGroupMappingXCC | [1, 8] | [1,2,4,8,16,32,64] | Missing 73% of prod values |
+| MatrixInstruction | 2 types | 9 types | Missing gfx950 MI128/MI64 |
+| GlobalSplitUAlgorithm | MultipleBufferSingleKernel | MultipleBuffer (100%) | Mismatch |
+| 1LDSBuffer | [-1] (auto→0) | 1 (70%) | Defaulting to wrong value |
+| TransposeLDS | [0, 1] | [0, 1, 2] | Missing TLDS=2 (21% of prod) |
+
+Estimated theoretical search space: ~9×10²⁰ combinations (most invalid).
+The production library's 6,325 kernels represent a heavily curated subset.
