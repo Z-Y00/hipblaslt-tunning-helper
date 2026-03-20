@@ -178,3 +178,12 @@ For each shape, the script:
 - **Output**: Set `--output-dir` (default: `tunning_results/`)
 - **Cleanup**: Post-tuning cleanup deletes `.o`/`.s`/`.co`/`.hsaco` and compresses each
   shape dir to `.tar.zst` (~2 MB/shape vs ~1.9 GB). Disable with `--no-cleanup`.
+
+
+# batch size 
+obtained from here and +-2:
+
+https://amd-hub.atlassian.net/browse/AISQA-3424
+# TODO
+Deepseek MLA align
+Note on DeepSeek-V2-Lite: It's an MoE model with MLA attention. I used the dense FFN intermediate_size=10944 (from first_k_dense_replace=1 layer) and approximated MLA as standard MHA with head_dim=128. The actual MLA Q/K projections use qk_nope_head_dim=128 + qk_rope_head_dim=64 = 192 per head with compressed KV (kv_lora_rank=512), so the generated attention shapes are approximate.

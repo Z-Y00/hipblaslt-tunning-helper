@@ -35,7 +35,8 @@ import sys
 import textwrap
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue
 from pathlib import Path
 from typing import Optional
 
@@ -488,26 +489,28 @@ def _tail_hint(path, n=5):
 def parse_tensile_csv(case_dir):
     archive = case_dir.with_suffix(".tar.zst")
     if not case_dir.is_dir() and archive.is_file():
-        # Extract just the CSVWinner.csv from the compressed archive
-        try:
-            proc = subprocess.run(
-                f"zstd -dc {archive} | tar tf - | grep CSVWinner.csv",
-                shell=True, capture_output=True, text=True, timeout=30,
-            )
-            csv_member = proc.stdout.strip().split("\n")[0] if proc.stdout.strip() else ""
-            if csv_member:
-                extract = subprocess.run(
-                    f"zstd -dc {archive} | tar xf - -O {csv_member}",
-                    shell=True, capture_output=True, text=True, timeout=60,
+        for pattern in ["CSVWinner.csv", "00_Final.csv"]:
+            try:
+                proc = subprocess.run(
+                    f"zstd -dc {archive} | tar tf - | grep {pattern}",
+                    shell=True, capture_output=True, text=True, timeout=30,
                 )
-                if extract.returncode == 0 and extract.stdout:
-                    import io
-                    return _parse_csv_content(io.StringIO(extract.stdout))
-        except Exception:
-            pass
+                csv_member = proc.stdout.strip().split("\n")[0] if proc.stdout.strip() else ""
+                if csv_member:
+                    extract = subprocess.run(
+                        f"zstd -dc {archive} | tar xf - -O {csv_member}",
+                        shell=True, capture_output=True, text=True, timeout=60,
+                    )
+                    if extract.returncode == 0 and extract.stdout:
+                        import io
+                        return _parse_csv_content(io.StringIO(extract.stdout))
+            except Exception:
+                pass
         return None
 
     csv_files = list(case_dir.rglob("*CSVWinner.csv"))
+    if not csv_files:
+        csv_files = list(case_dir.rglob("00_Final.csv"))
     if not csv_files:
         return None
     with open(csv_files[0]) as f:
@@ -1334,31 +1337,39 @@ def main():
             results.append(row)
     else:
         results = [None] * total
-        with ThreadPoolExecutor(max_workers=n_gpus) as pool:
-            futures = {}
-            for i, shape in enumerate(shapes):
-                device = gpu_ids[i % n_gpus]
-                fut = pool.submit(_process_one_shape, shape, i, total,
-                                  header, footer, out_dir, args, device)
-                futures[fut] = i
-            for fut in as_completed(futures):
-                idx = futures[fut]
+        shape_queue = Queue()
+        for i, shape in enumerate(shapes):
+            shape_queue.put((i, shape))
+
+        def _gpu_worker(gpu_id):
+            while True:
                 try:
-                    results[idx] = fut.result()
+                    i, shape = shape_queue.get_nowait()
+                except Exception:
+                    break
+                try:
+                    results[i] = _process_one_shape(
+                        shape, i, total, header, footer,
+                        out_dir, args, gpu_id)
                 except Exception as e:
-                    _thread_print(f"ERROR processing shape {idx}: {e}")
-                    results[idx] = {
-                        "model": shapes[idx]["model"],
-                        "layer": shapes[idx]["layer"],
-                        "phase": shapes[idx].get("phase", "fwd"),
-                        "mbs": shapes[idx]["mbs"],
-                        "trans": _trans_code(shapes[idx].get("trans_a", True),
-                                             shapes[idx].get("trans_b", False)),
-                        **{k: shapes[idx][k] for k in ("M", "N", "K")},
+                    _thread_print(f"ERROR processing shape {i}: {e}")
+                    results[i] = {
+                        "model": shapes[i]["model"],
+                        "layer": shapes[i]["layer"],
+                        "phase": shapes[i].get("phase", "fwd"),
+                        "mbs": shapes[i]["mbs"],
+                        "trans": _trans_code(shapes[i].get("trans_a", True),
+                                             shapes[i].get("trans_b", False)),
+                        **{k: shapes[i][k] for k in ("M", "N", "K")},
                         "tensile_tflops": None, "tensile_time_us": None,
                         "tensile_winner": None, "bench_tflops": None,
                         "bench_time_us": None, "bench_kernel": None,
                     }
+
+        with ThreadPoolExecutor(max_workers=n_gpus) as pool:
+            futures = [pool.submit(_gpu_worker, gid) for gid in gpu_ids]
+            for fut in futures:
+                fut.result()
 
     valid = [r for r in results if r is not None]
     if valid and (args.run or args.compare_only):

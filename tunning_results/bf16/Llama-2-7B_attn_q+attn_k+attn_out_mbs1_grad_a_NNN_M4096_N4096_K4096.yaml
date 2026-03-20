@@ -1,0 +1,122 @@
+TestParameters:
+  marks: [skip-gfx900, skip-gfx906, skip-gfx908, skip-gfx90a, skip-gfx940, skip-gfx941, skip-gfx942, skip-gfx1010, skip-gfx1011, skip-gfx1012, skip-gfx1030, skip-gfx1100, skip-gfx1101, skip-gfx1102, skip-gfx1200, skip-gfx1201] # not supported by arch
+
+GlobalParameters:
+  SkipSlowSolutionRatio: 0.5
+  NumElementsToValidate: 128 # skip full validation for fast tuning
+  NumWarmups: 30
+  NumBenchmarks: 1
+  SyncsPerBenchmark: 1
+  EnqueuesPerSync: 50
+  CSVExportWinner: 1 # Lorri: save the winner
+  CSVMergeSameProblemID: 1
+  Device: 0 # Lorri: must do everything on the same GPU, avoid GPU 2 GPU difference
+  RotatingBufferSize: 640 # Lorri:  Note 1: should be larger than LLC, need to change higher for future GPU, Note 2: some Grouped gemm is very laerge, 512M may not be enough and failure would be druing data init phase, seting here to 5GB
+  SleepPercent: 0 # Lorri: we don't pause, more like real situation
+  PrintLevel: 1
+  PrintSolutionRejectionReason: True
+  #Device: 0
+  CMakeBuildType: Release
+  MergeFiles: False
+  KernelTime: True
+  MaxWorkspaceSize: 13421772800
+  DataInitTypeA: 3
+  DataInitTypeB: 3
+  #DataInitTypeC: 21
+  DataInitTypeAlpha: 1
+  DataInitTypeBeta: 0
+  #DataInitTypeBias: 21
+  DataInitTypeScaleAlphaVec: 1
+  DataInitTypeScaleA: 1
+  DataInitTypeScaleB: 1
+  MinKForGSU: 1
+  NumElementsToValidate: 128
+  BoundsCheck: 2
+  MaxLDS: 163840
+  DeviceLDS: 163840
+  KeepBuildTmp: True # see knowledge.md
+  PrintSolutionRejectionReason: True # Lorri: Debugging
+
+BenchmarkProblems:
+
+  ########################################
+  # bf16 NN
+  ########################################
+  -
+    - # ProblemType # Lorri: see https://amd.atlassian.net/wiki/spaces/DCGPUAIST/pages/1116517153/hipblasLt+Grouped+Gemm+Tune
+      OperationType: GEMM
+      DataType: b
+      DestDataType: b
+      ComputeDataType: s
+      HighPrecisionAccumulate: True
+      TransposeA: 0
+      TransposeB: 0
+      UseBeta: True
+      Batched: True
+      UseBias:       1
+      BiasDataTypeList: ['S','B'] # Lorri: f32_r and bf16_r for bias type, more robust matching
+      # BiasSrc: # Lorri: see hipblaslt/tensilelite/Tensile/Utilities/tensile_generator/tensile_config_generator.py
+      Activation:    True
+      ActivationType: hipblaslt_all
+      UseScaleAlphaVec: 1
+      GroupedGemm:   False
+    - # BenchmarkProblemSizeGroup - Standard
+      InitialSolutionParameters:
+      BenchmarkCommonParameters:
+        - KernelLanguage: ["Assembly"]
+      ForkParameters:
+        # Lorri: from hipblaslt/tensilelite/Tensile/Tests/common/gemm/gfx950/bf16_cvt.yaml
+        - MatrixInstruction: # see knowledge.md
+          - [32, 32,16, 1,  1,   4, 2,  2,2 ]
+          - [32, 32,16, 1,  1,   4, 4,  2,2 ]
+          - [32, 32,16, 1,  1,   2, 4,  4,1 ]
+          - [32, 32,16, 1,  1,   2, 8,  4,1 ]
+          - [32, 32,16, 1,  1,   8, 1,  1,4 ]
+          - [32, 32,16, 1,  1,   8, 2,  1,4 ]
+          - [16, 16,32, 1,  1,   8, 4,  2,2 ]
+          - [16, 16,32, 1,  1,   8, 8,  2,2 ]
+          - [16, 16,32, 1,  1,   4, 8,  4,1 ]
+          - [16, 16,32, 1,  1,   4, 16,  4,1 ]
+          - [16, 16,32, 1,  1,   16, 2,  1,4 ]
+          - [16, 16,32, 1,  1,   16, 4,  1,4 ]
+          # - [16, 16, 4, 4]
+          # - [16, 16, 16, 1]
+          # - [4, 4, 4, 16]
+        - PrefetchGlobalRead: [2]
+        - PrefetchLocalRead: [1]
+  #        - ClusterLocalRead: [1]
+        # - DepthU: [32]
+        - DepthU: [32,64]
+        - LocalReadVectorWidth: [-1]
+        - ScheduleIterAlg: [3]
+          #        - ExpandPointerSwap: [0]
+        - TransposeLDS: [0, 1] #0,1
+        - DirectToLds: [0, 1]
+        - LdsBlockSizePerPadA: [-1]
+        - LdsBlockSizePerPadB: [-1]
+        - LdsPadA: [-1]
+        - LdsPadB: [-1]
+        # - NonTemporalB: [0]
+        - NonTemporalB: [0,4] # Lorri: allow non-temporal load for B to bypass cache coherency, we have to try both at tunning based on different gemm size
+        - StaggerU: [0]
+        - StaggerUStride: [16]
+        - WorkGroupMappingXCC: [1, 8]
+        - WorkGroupMappingXCCGroup: [-1]
+        - 1LDSBuffer: [-1]
+        - GlobalSplitU: [-1] # see knowledge.md
+        - GlobalSplitUAlgorithm: ["MultipleBufferSingleKernel"]
+        #- PreloadKernArgs: [0, 1]
+        - StreamK: [0, 3]
+        - SourceSwap: [1]
+      BenchmarkJoinParameters:
+      BenchmarkFinalParameters:
+        - ProblemSizes: # Lorri: see https://amd.atlassian.net/wiki/spaces/~7120202add2b96de67481bbcfa5e99f875033a/pages/833108349/Single+Grouped+GEMM+kernel
+          - Exact: [4096, 4096, 1, 4096]
+        - BiasTypeArgs: ['S','B'] # Lorri: f32_r and bf16_r for bias type, more robust matching
+        - ActivationArgs:
+          - [Enum: none]
+LibraryLogic: # Lorri, see hipblaslt/tensilelite/Tensile/Tests/common/gemm/gfx950/xfp32.yaml
+    ScheduleName: "gfx950"
+    DeviceNames: ["Device 0049", "Device 0050"]
+    ArchitectureName: "gfx950"
+    LibraryType: "Equality"
