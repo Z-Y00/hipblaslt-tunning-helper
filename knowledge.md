@@ -461,6 +461,132 @@ vs `hipblaslt-bench` comes from `hipblaslt-bench`'s use of rotating buffers
 drivers (Tensile YAML, `hipblaslt-bench --rotating`, `test_hipblaslt_api --rotating`)
 via `compute_rotating_buffer_mb()`, so all measure under identical cache conditions.
 
+### BiasDataTypeList Causes Two Client Passes
+
+The Tensile client benchmarks each solution **twice** when `BiasDataTypeList`
+contains multiple entries. In our template (`bf16_gemm_gfx950.yaml`):
+
+```yaml
+BiasDataTypeList: ['S','B']   # line 57 — FP32 and BF16 bias types
+BiasTypeArgs: ['S','B']       # line 111 — same list for final benchmark
+```
+
+This produces two passes visible in the `.tensile.log`:
+
+- Pass `0,0/1` — bias type `Float` (S)
+- Pass `0,1/1` — bias type `BFloat16` (B)
+
+The progress counter (e.g., `0,0/1,209/231`) resets to 0 when the second pass
+begins, which can look like the client restarted. The `SkipSlowSolutionRatio: 0.7`
+setting skips solutions that are >1/0.7 ≈ 1.43x slower than the current best during
+warmup, reducing wasted time on poor candidates.
+
+**Impact**: This doubles the client benchmarking time. If only BF16 bias is needed,
+changing to `['B']` would halve client runtime. We keep both for broader library
+coverage so the tuned kernels work regardless of bias precision.
+
+### Tensile Kernel Name Abbreviations
+
+Tensile encodes every tuning parameter into the kernel name as abbreviated
+key-value pairs. Common abbreviations:
+
+| Abbrev | Full Name | Example | Meaning |
+|--------|-----------|---------|---------|
+| `MT256x256x64` | MacroTile | 256×256×64 | Tile dimensions (M×N×K per workgroup) |
+| `MI16x16x1` | MatrixInstruction | 16×16×1 | MFMA instruction shape |
+| `AFC0`/`AFC1` | AssertFree0ElementMultiple | 0 or 1 | No alignment constraint on M. Higher values (e.g. AFC8) require M%8==0 but enable wider vector loads |
+| `AG0` | AssertGrouped | 0 | Not a grouped GEMM (standard GEMM) |
+| `GSU0` | GlobalSplitU | 0 | No K-splitting across workgroups; GSU>0 splits K reduction |
+| `TLDS1` | TransposeLDS | 1 | LDS data layout is transposed |
+| `DTL{A,B}1` | DirectToLds{A,B} | 1 | Load global mem directly into LDS (bypass registers) |
+| `WG32_8_1` | WorkGroup | 32×8×1 | Workgroup thread layout |
+| `SK3` | StreamK | 3 | Stream-K partitioning enabled for better load balance |
+| `NTB0`/`NTB4` | NonTemporalB | 0 or 4 | 0=normal cached loads for B; 4=non-temporal (bypass cache coherency) |
+| `PLR1` | PrefetchLocalRead | 1 | Prefetch from LDS enabled |
+| `PGR2` | PrefetchGlobalRead | 2 | Double-buffer global prefetch |
+| `LBSPPA`/`LBSPPB` | LdsBlockSizePerPadA/B | bytes | LDS padding to avoid bank conflicts |
+| `LPA`/`LPB` | LdsPadA/B | elements | Additional LDS padding |
+| `WGM8` | WorkGroupMapping | 8 | Workgroup mapping stride for cache locality |
+| `WGMXCC8` | WorkGroupMappingXCC | 8 | Cross-XCC workgroup mapping (MI300-specific) |
+
+`AFC0` and `AFC1` are functionally equivalent — both mean "no alignment
+requirement." The distinction only matters at `AFC8` or higher where the kernel
+assumes M is a multiple of that value for performance.
+
+### NonTemporalD Was Missing from Search Space (Critical Finding)
+
+Analysis of 79 completed shapes (Llama-3.1-70B) revealed a systematic mismatch:
+
+| Parameter | Tensile winners | API installed kernels |
+|-----------|----------------|---------------------|
+| **NTD0** (temporal D writes) | **78** | 2 |
+| **NTD4** (non-temporal D writes) | **0** | **76** |
+| **NTB0** (temporal B loads) | 73 | **78** |
+| **NTB4** (non-temporal B loads) | 5 | 0 |
+
+**Root cause**: `NonTemporalD` was not listed in the template's `ForkParameters`,
+so all Tensile-generated solutions defaulted to `NTD0`. The production hipBLASLt
+library uses `NTD4` on 76/78 shapes — bypassing cache coherency on output matrix
+writes, which provides a consistent ~2-5% speedup for large GEMMs.
+
+This explained why nearly all T/A ratios were 95-99% rather than ≥100%.
+
+**Fix**: Added `- NonTemporalD: [0,4]` to `ForkParameters` in
+`templates/bf16_gemm_gfx950.yaml`. This doubles the solution count but allows
+Tensile to explore the same kernel configuration space as the production library.
+
+Note: `NonTemporalB: [0,4]` was already enabled in the template. The API library
+consistently uses `NTB0`, so this hasn't been a source of mismatch.
+
+**Update**: After adding NTD4 to the search space and re-running
+`mlp_gate_up mbs=2 fwd`, Tensile's winner was still NTD0 (1322 TFLOPS), not
+NTD4. Under Tensile's cold-cache (rotating buffer) measurement, NTD4 provides
+no benefit — non-temporal D writes bypass cache, which doesn't help when the
+cache is already cold. The API bench (warm cache) measures 1404 TFLOPS with
+NTD4 because bypassing cache avoids polluting L2 with output data. This means
+the T/A gap for NTD is a **measurement artifact**, not a real kernel quality
+difference in production workloads.
+
+### DirectToLds (DTL) Analysis
+
+Both Tensile and the installed API library strongly prefer `DTLA=1 DTLB=1`
+(direct global-to-LDS loads for both matrices A and B):
+
+| Config | Tensile winners | API installed |
+|--------|----------------|--------------|
+| DTLA=1, DTLB=1 | 78 / 79 | 76 / 79 |
+| DTLA=0, DTLB=0 | 0 | 2 (small attn_k shapes) |
+| Custom kernel | 1 | 1 |
+
+DirectToLds bypasses registers and loads data directly into LDS, reducing
+register pressure and latency. It is overwhelmingly preferred for all shapes
+except very small ones (N=1024) where the tile size doesn't benefit from it.
+
+`TransposeLDS` is also well-aligned: TLDS=1 wins 51 shapes, TLDS=0 wins 27,
+identical split between Tensile and API. Neither parameter is a source of
+T/A mismatch.
+
+### Tensile Client vs hipblasLtMatmul Dispatch Gap (~7%)
+
+**Critical finding**: The exact same kernel binary shows ~7% lower TFLOPS when
+benchmarked through the Tensile client vs `hipblasLtMatmul`. Verified on
+`mlp_gate_up mbs=2 fwd` (M=57344, N=16384, K=8192):
+
+| Dispatch path | Latency | TFLOPS |
+|---------------|---------|--------|
+| Tensile client (`hipExtModuleLaunchKernel`) | 11,737 µs | 1312 |
+| API bench (`hipblasLtMatmul`) | 10,966 µs | 1404 |
+
+Conditions were identical: same kernel name, same warm-cache (rotating=0),
+same data init (random [-3,3] BF16), same event-pair timing around 50 enqueues,
+same assembler flags and code object version.
+
+The ~15 µs/call gap comes from the dispatch path difference. This means
+**T/A ratios of 93-95% do not indicate a worse kernel** — they reflect a
+systematic measurement bias in the Tensile client.
+
+See `tunning_results/archive/tensile-vs-api-dispatch-gap/` for full evidence.
+
 ### Why attn_k (M=1024) Is an Outlier
 
 The smallest shape `attn_k` (M8192_N1024_K4096) shows 785 TF via API vs 1223 TF

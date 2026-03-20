@@ -487,7 +487,7 @@ def _tail_hint(path, n=5):
 
 
 def parse_tensile_csv(case_dir):
-    archive = case_dir.with_suffix(".tar.zst")
+    archive = case_dir.parent / (case_dir.name + ".tar.zst")
     if not case_dir.is_dir() and archive.is_file():
         for pattern in ["CSVWinner.csv", "00_Final.csv"]:
             try:
@@ -582,7 +582,7 @@ def _cleanup_shape_dir(case_dir: Path, compress: bool = True):
             print(f"    [cleanup] removed {removed} rebuildable files")
         return
 
-    archive = case_dir.with_suffix(".tar.zst")
+    archive = case_dir.parent / (case_dir.name + ".tar.zst")
     try:
         result = subprocess.run(
             ["tar", "cf", "-", "-C", str(case_dir.parent), case_dir.name],
@@ -1253,6 +1253,10 @@ def main():
                              "E4M3 A / E5M2 B). Default: bf16")
     parser.add_argument("--filter", type=str, default=None,
                         help="Filter shapes by model name substring")
+    parser.add_argument("--filter-layer", type=str, default=None,
+                        help="Filter shapes by layer name substring (e.g. 'lm_head')")
+    parser.add_argument("--filter-mbs", type=str, default=None,
+                        help="Comma-separated MBS values to include (e.g. '4' or '1,4,8')")
     parser.add_argument("--max-shapes", type=int, default=None,
                         help="Limit number of shapes to process")
     parser.add_argument("--output-dir", type=str, default=str(OUTPUT_DIR),
@@ -1285,6 +1289,11 @@ def main():
 
     shapes = gen_all_shapes(model_filter=args.filter,
                             include_bwd=not args.fwd_only)
+    if args.filter_layer:
+        shapes = [s for s in shapes if args.filter_layer.lower() in s["layer"].lower()]
+    if args.filter_mbs:
+        mbs_set = {int(x.strip()) for x in args.filter_mbs.split(",")}
+        shapes = [s for s in shapes if s["mbs"] in mbs_set]
     if args.max_shapes:
         shapes = shapes[:args.max_shapes]
 

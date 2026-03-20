@@ -2,12 +2,12 @@ TestParameters:
   marks: [skip-gfx900, skip-gfx906, skip-gfx908, skip-gfx90a, skip-gfx940, skip-gfx941, skip-gfx942, skip-gfx1010, skip-gfx1011, skip-gfx1012, skip-gfx1030, skip-gfx1100, skip-gfx1101, skip-gfx1102, skip-gfx1200, skip-gfx1201] # not supported by arch
 
 GlobalParameters:
-  SkipSlowSolutionRatio: 0.5
+  SkipSlowSolutionRatio: 0.7
   NumElementsToValidate: 128 # skip full validation for fast tuning
-  NumWarmups: 30
+  NumWarmups: 20
   NumBenchmarks: 1
   SyncsPerBenchmark: 1
-  EnqueuesPerSync: 50
+  EnqueuesPerSync: 30
   CSVExportWinner: 1 # Lorri: save the winner
   CSVMergeSameProblemID: 1
   Device: 0 # Lorri: must do everything on the same GPU, avoid GPU 2 GPU difference
@@ -88,6 +88,7 @@ BenchmarkProblems:
         - LdsBlockSizePerPadB: [-1]
         - LdsPadA: [-1]
         - LdsPadB: [-1]
+        # - NonTemporalD: [0,4]
         # - NonTemporalB: [0]
         - NonTemporalB: [0,4] # Lorri: allow non-temporal load for B to bypass cache coherency, we have to try both at tunning based on different gemm size
         - StaggerU: [0]
@@ -108,7 +109,7 @@ BenchmarkProblems:
           - Exact: [512,   5120, 1, 1536] 
           - Exact: [512,   5120, 1, 1536] 
           - Exact: [512,   5120, 1, 1536] 
-        - BiasTypeArgs: ['S','B'] # Lorri: f32_r and bf16_r for bias type, more robust matching
+        - BiasTypeArgs: ['S'] # Lorri: we only keep one for profiling, as otherwise we will x2 the runtime
         - ActivationArgs:
           - [Enum: none]
 LibraryLogic: # Lorri, see hipblaslt/tensilelite/Tensile/Tests/common/gemm/gfx950/xfp32.yaml

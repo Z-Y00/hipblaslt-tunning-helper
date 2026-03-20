@@ -226,6 +226,11 @@ def gen_gemm_test_cases_extended(cfg, model_name=None):
 
     shapes = []
 
+    # -- Vocab projection (lm_head) — first so it gets prioritised --
+    vocab = cfg.get("vocab_size")
+    if vocab:
+        shapes.append(("lm_head",  seq, vocab,                        h))
+
     if is_mla:
         print(f"  [TODO] {model_name or '?'}: skipping attention shapes — "
               f"MLA projections need real profiling to determine GEMM dims")
@@ -240,11 +245,6 @@ def gen_gemm_test_cases_extended(cfg, model_name=None):
     # -- Split MLP --
     shapes.append(("mlp_gate",    seq, inter,                        h))
     shapes.append(("mlp_down",    seq, h,                            inter))
-
-    # -- Vocab projection (lm_head) --
-    vocab = cfg.get("vocab_size")
-    if vocab:
-        shapes.append(("lm_head",  seq, vocab,                        h))
 
     return shapes
 
