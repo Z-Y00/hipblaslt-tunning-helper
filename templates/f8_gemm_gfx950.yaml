@@ -86,9 +86,9 @@ BenchmarkProblems:
         - WorkGroupMappingXCC: [1, 8]
         - WorkGroupMappingXCCGroup: [-1]
         - 1LDSBuffer: [0,1] # both shown in the above mentioned gfx950 yaml folder, and the default -1 seems not always the best, as it will use 1 only when exceed max size
-        - GlobalSplitU: 0
+        - GlobalSplitU: [0]
         - GlobalSplitUAlgorithm: ["MultipleBuffer"] # same as above mentioned gfx950 yaml folder
-        - PreloadKernArgs: true # same as above mentioned gfx950 yaml folder
+        - PreloadKernArgs: [true] # same as above mentioned gfx950 yaml folder
         - ClusterLocalRead: [0,1] # both shown in the above mentioned gfx950 yaml folder
         - StreamK: [0, 3]
         - SourceSwap: [1]

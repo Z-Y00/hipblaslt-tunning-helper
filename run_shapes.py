@@ -1161,12 +1161,15 @@ def _process_one_shape(shape, idx, total, header, footer, out_dir, args, device)
         parts.append(f"API={a:.1f}")
     if b is not None:
         parts.append(f"Bench={b:.1f}")
-    ratio = ""
+    ratios = []
     if t and a and a > 0:
-        ratio = f"  (T/A={t/a:.0%})"
-    elif t and b and b > 0:
-        ratio = f"  (T/B={t/b:.0%})"
-    _thread_print(f"  >> {' | '.join(parts)}{ratio}")
+        ratios.append(f"T/A={t/a:.0%}")
+    if t and b and b > 0:
+        ratios.append(f"T/B={t/b:.0%}")
+    elif a and b and b > 0:
+        ratios.append(f"A/B={a/b:.0%}")
+    ratio_str = f"  ({', '.join(ratios)})" if ratios else ""
+    _thread_print(f"  >> {' | '.join(parts)}{ratio_str}")
 
     tw = row.get("tensile_winner")
     ak = row.get("api_kernel")
@@ -1286,12 +1289,15 @@ def main():
                         help="Skip post-tuning cleanup (keep all build artifacts)")
     parser.add_argument("--no-compress", action="store_true",
                         help="Delete .o/.co/.hsaco but don't compress the shape dir")
+    parser.add_argument("--quick-sweep", action="store_true",
+                        help="Only run BS=1 for each model (quick coverage check)")
 
     args = parser.parse_args()
     out_dir = Path(args.output_dir).resolve() / args.dtype
 
     shapes = gen_all_shapes(model_filter=args.filter,
-                            include_bwd=not args.fwd_only)
+                            include_bwd=not args.fwd_only,
+                            quick_sweep=args.quick_sweep)
     if args.filter_layer:
         shapes = [s for s in shapes if args.filter_layer.lower() in s["layer"].lower()]
     if args.filter_mbs:

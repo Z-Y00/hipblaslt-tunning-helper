@@ -53,19 +53,6 @@ BATCH_SIZE_LIST = list(range(1, 10))  # fallback default
 ###############################################################################
 
 DenseModelConfigs = {
-    # https://huggingface.co/meta-llama/Llama-3.1-70B/blob/main/config.json
-    # BF16 MBS=1 (Primus) + MBS=3 (Primus-TT) + MBS=6 (Llama-3.3-70B, same arch)
-    # Prioritized: test BS=4 first
-    "Llama-3.1-70B": {
-        "seqlen": 8192,
-        "hidden_size": 8192,
-        "intermediate_size": 28672,
-        "vocab_size": 128256,
-        "num_attention_heads": 64,
-        "num_key_value_heads": 8,
-        "head_dim": 128,
-        "batch_sizes": [4, 1, 2, 3, 5, 6, 7, 8], # Lorri, for quick check for regression case
-    },
     # https://huggingface.co/meta-llama/Llama-2-7b/blob/main/config.json
     # BF16 MBS=10
     "Llama-2-7B": {
@@ -101,6 +88,18 @@ DenseModelConfigs = {
         "num_key_value_heads": 8,
         "head_dim": 128,
         "batch_sizes": [2, 3, 4, 5, 6, 7, 8],
+    },
+    # https://huggingface.co/meta-llama/Llama-3.1-70B/blob/main/config.json
+    # BF16 MBS=1 (Primus) + MBS=3 (Primus-TT) + MBS=6 (Llama-3.3-70B, same arch)
+    "Llama-3.1-70B": {
+        "seqlen": 8192,
+        "hidden_size": 8192,
+        "intermediate_size": 28672,
+        "vocab_size": 128256,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "batch_sizes": [1, 2, 3, 4, 5, 6, 7, 8], 
     },
     # https://huggingface.co/meta-llama/Llama-3.1-405B/blob/main/config.json
     # Not in BF16 benchmark table — keeping conservative range
@@ -265,19 +264,21 @@ def _fwd_bwd_shapes(model, layer, mbs, M, N, K):
     ]
 
 
-def gen_all_shapes(model_filter=None, include_bwd=True):
+def gen_all_shapes(model_filter=None, include_bwd=True, quick_sweep=False):
     """Generate GEMM shape tuples for tuning.
 
     Covers both fused (QKV, gate+up) and split (Q, K, gate) projections
     plus lm_head.  Deduplicates shapes that have identical (M, N, K,
     trans_a, trans_b) within the same model+mbs, merging layer names.
+
+    If quick_sweep=True, only run BS=1 for each model (skip other batch sizes).
     """
     shapes = []
     for name, cfg in DenseModelConfigs.items():
         if model_filter and model_filter.lower() not in name.lower():
             continue
         cases = gen_gemm_test_cases_extended(cfg, model_name=name)
-        bs_list = cfg.get("batch_sizes", BATCH_SIZE_LIST)
+        bs_list = [1] if quick_sweep else cfg.get("batch_sizes", BATCH_SIZE_LIST)
         for mbs in bs_list:
             seen = {}
             raw = []

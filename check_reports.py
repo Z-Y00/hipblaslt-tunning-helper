@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Parse .report.md files and categorize shapes by T/A ratio.
+"""Parse .report.md files and categorize shapes by T/B ratio (Tensile / hipblaslt-bench).
 
 Also extracts Tensile wall-clock time from .tensile.log files and
 summarises per-model timing with smallest/largest batch size breakdowns.
@@ -29,7 +29,6 @@ def _parse_tensile_time(log_path):
     m = re.search(r"Finish Analysing data to .+ in ([\d.]+)s", tail)
     if m:
         return float(m.group(1))
-    # Fallback: use file birth → modify delta
     try:
         st = log_path.stat()
         birth = st.st_ctime
@@ -53,51 +52,43 @@ def parse_report(path):
     phase = _field("Phase")
     mbs = _field("MBS")
 
-    ta_match = re.search(r"Tuned/API ratio.*?([\d.]+)%", text)
-    ta_ratio = float(ta_match.group(1)) if ta_match else None
-
     tensile_row = re.search(r"\*\*Tensile tuned\*\*\s*\|\s*([\d.]+)", text)
     api_row = re.search(r"\*\*API bench.*?\*\*\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)", text)
-    bench_row = re.search(r"\*\*hipblaslt-bench.*?\*\*\s*\|\s*([\d.]+)", text)
+    bench_row = re.search(r"\*\*hipblaslt-bench.*?\*\*\s*\|\s*([\d.]+)\s*\|\s*([\d.]+)", text)
     tensile_tflops = float(tensile_row.group(1)) if tensile_row else None
     api_tflops = float(api_row.group(1)) if api_row else None
     api_time_us = float(api_row.group(2)) if api_row else None
     bench_tflops = float(bench_row.group(1)) if bench_row else None
+    bench_time_us = float(bench_row.group(2)) if bench_row else None
 
     m_val = _field("M")
     n_val = _field("N")
     k_val = _field("K")
 
-    # Tensile elapsed time from .tensile.log
     log_name = path.name.replace(".report.md", ".tensile.log")
     log_path = path.parent / log_name
     tensile_secs = _parse_tensile_time(log_path)
 
+    tb_ratio = None
+    if tensile_tflops and bench_tflops and bench_tflops > 0:
+        tb_ratio = tensile_tflops / bench_tflops * 100
+
     return {
         "file": path.name,
-        "model": model,
-        "layer": layer,
-        "phase": phase,
-        "mbs": mbs,
-        "M": m_val,
-        "N": n_val,
-        "K": k_val,
-        "tensile": tensile_tflops,
-        "api": api_tflops,
-        "bench": bench_tflops,
-        "api_time_us": api_time_us,
-        "ta_ratio": ta_ratio,
-        "tensile_secs": tensile_secs,
+        "model": model, "layer": layer, "phase": phase, "mbs": mbs,
+        "M": m_val, "N": n_val, "K": k_val,
+        "tensile": tensile_tflops, "api": api_tflops, "bench": bench_tflops,
+        "api_time_us": api_time_us, "bench_time_us": bench_time_us,
+        "tb_ratio": tb_ratio, "tensile_secs": tensile_secs,
     }
 
 
 BUCKETS = [
-    ("T/A \u2264 90%  (Tensile much worse)", lambda r: r <= 90),
-    ("90% < T/A \u2264 95%  (Tensile worse)", lambda r: 90 < r <= 95),
-    ("95% < T/A \u2264 100% (Tensile slightly worse)", lambda r: 95 < r <= 100),
-    ("100% < T/A \u2264 105% (Tensile slightly better)", lambda r: 100 < r <= 105),
-    ("105% < T/A \u2264 110% (Tensile better)", lambda r: 105 < r <= 110),
-    ("T/A > 110% (Tensile much better \u2014 suspect)", lambda r: r > 110),
+    ("T/B \u2264 95%  (Tensile worse than stock)", lambda r: r <= 95),
+    ("95% < T/B \u2264 100% (Tensile \u2248 stock)", lambda r: 95 < r <= 100),
+    ("100% < T/B \u2264 105% (Tensile slightly better)", lambda r: 100 < r <= 105),
+    ("105% < T/B \u2264 115% (Tensile better)", lambda r: 105 < r <= 115),
+    ("T/B > 115% (Tensile much better)", lambda r: r > 115),
 ]
 
 
@@ -117,31 +108,31 @@ def main():
         return
 
     entries = []
-    no_ta = []
+    no_tb = []
     for r in reports:
         try:
             e = parse_report(r)
         except Exception as exc:
             print(f"WARN: failed to parse {r.name}: {exc}", file=sys.stderr)
             continue
-        if e["ta_ratio"] is None:
-            no_ta.append(e)
-        else:
+        if e["tb_ratio"] is not None:
             entries.append(e)
+        else:
+            no_tb.append(e)
 
-    all_entries = entries + no_ta
+    all_entries = entries + no_tb
 
     # --- Per-bucket breakdown ---
     bucketed = defaultdict(list)
     for e in entries:
         for label, pred in BUCKETS:
-            if pred(e["ta_ratio"]):
+            if pred(e["tb_ratio"]):
                 bucketed[label].append(e)
                 break
 
     print(f"{'='*80}")
-    print(f"  T/A Ratio Report  \u2014  {len(entries)} shapes with T/A, "
-          f"{len(no_ta)} without (Tensile or API N/A)")
+    print(f"  T/B Ratio Report (Tensile / hipblaslt-bench)")
+    print(f"  {len(entries)} shapes with T/B, {len(no_tb)} without")
     print(f"{'='*80}\n")
 
     # --- Distribution bar chart ---
@@ -149,8 +140,8 @@ def main():
         BAR_WIDTH = 40
         max_count = max(len(bucketed.get(label, [])) for label, _ in BUCKETS)
         max_count = max(max_count, 1)
-        short_labels = ["\u226490%", "90-95%", "95-100%", "100-105%", "105-110%", ">110%"]
-        print("  T/A Distribution:")
+        short_labels = ["\u226495%", "95-100%", "100-105%", "105-115%", ">115%"]
+        print("  T/B Distribution:")
         print()
         for (label, _), short in zip(BUCKETS, short_labels):
             count = len(bucketed.get(label, []))
@@ -171,39 +162,39 @@ def main():
             for model in sorted(by_model):
                 shapes = by_model[model]
                 print(f"    {model} ({len(shapes)}):")
-                for s in sorted(shapes, key=lambda x: x["ta_ratio"]):
-                    api_us = f"{s['api_time_us']/1000:.2f}ms" if s.get("api_time_us") else "N/A"
-                    print(f"      {s['ta_ratio']:6.1f}%  "
+                for s in sorted(shapes, key=lambda x: x["tb_ratio"]):
+                    bench_ms = f"{s['bench_time_us']/1000:.2f}ms" if s.get("bench_time_us") else "N/A"
+                    print(f"      T/B={s['tb_ratio']:5.1f}%  "
                           f"mbs={s['mbs']:>2}  {s['layer']:<20} [{s['phase']}]  "
                           f"M={s['M']} N={s['N']} K={s['K']}  "
-                          f"T={s['tensile']:.0f} A={s['api']:.0f} B={s['bench']:.0f}  "
-                          f"({api_us})")
+                          f"T={s['tensile']:.0f} B={s['bench']:.0f}  "
+                          f"({bench_ms})")
         print()
 
     # --- Summary stats ---
-    ratios = [e["ta_ratio"] for e in entries]
+    ratios = [e["tb_ratio"] for e in entries]
     if not ratios:
         print(f"{'\u2500'*80}")
-        print("  No shapes with T/A ratio to summarize.")
+        print("  No shapes with T/B ratio to summarize.")
     else:
         print(f"{'\u2500'*80}")
-        print(f"  Summary:  min={min(ratios):.1f}%  max={max(ratios):.1f}%  "
+        print(f"  T/B:  min={min(ratios):.1f}%  max={max(ratios):.1f}%  "
               f"mean={sum(ratios)/len(ratios):.1f}%  "
               f"median={sorted(ratios)[len(ratios)//2]:.1f}%")
         print()
 
-        # --- Per-model T/A summary ---
-        by_model_all = defaultdict(list)
+        # --- Per-model summary ---
+        by_model_tb = defaultdict(list)
         for e in entries:
-            by_model_all[e["model"]].append(e["ta_ratio"])
+            by_model_tb[e["model"]].append(e["tb_ratio"])
 
-        print(f"  {'Model':<25} {'Count':>5}  {'Min':>6}  {'Max':>6}  {'Mean':>6}  {'Median':>6}")
+        print(f"  {'Model':<25} {'Count':>5}  {'Min':>6}  {'Mean':>6}  {'Median':>6}  {'Max':>6}")
         print(f"  {'\u2500'*25} {'\u2500'*5}  {'\u2500'*6}  {'\u2500'*6}  {'\u2500'*6}  {'\u2500'*6}")
-        for model in sorted(by_model_all):
-            rs = sorted(by_model_all[model])
+        for model in sorted(by_model_tb):
+            rs = sorted(by_model_tb[model])
             n = len(rs)
-            print(f"  {model:<25} {n:>5}  {min(rs):>5.1f}%  {max(rs):>5.1f}%  "
-                  f"{sum(rs)/n:>5.1f}%  {rs[n//2]:>5.1f}%")
+            print(f"  {model:<25} {n:>5}  {min(rs):>5.1f}%  "
+                  f"{sum(rs)/n:>5.1f}%  {rs[n//2]:>5.1f}%  {max(rs):>5.1f}%")
 
     # --- Per-model timing ---
     print(f"\n{'\u2500'*80}")
@@ -217,9 +208,12 @@ def main():
     for model in sorted(by_model_time):
         shapes = by_model_time[model]
         timed = [e for e in shapes if e["tensile_secs"] is not None]
+        if not timed:
+            print(f"  {model}: no timing data")
+            print()
+            continue
         total_secs = sum(e["tensile_secs"] for e in timed)
 
-        # Group by mbs
         by_mbs = defaultdict(list)
         for e in timed:
             by_mbs[int(e["mbs"])].append(e["tensile_secs"])
@@ -227,7 +221,7 @@ def main():
         sorted_mbs = sorted(by_mbs.keys())
         print(f"  {model}")
         print(f"    Total: {len(timed)} shapes, {_fmt_time(total_secs)}  "
-              f"(avg {_fmt_time(total_secs / len(timed)) if timed else 'N/A'} / shape)")
+              f"(avg {_fmt_time(total_secs / len(timed))} / shape)")
 
         if sorted_mbs:
             for mbs in sorted_mbs:
@@ -247,16 +241,15 @@ def main():
         print()
 
     # --- N/A shapes ---
-    if no_ta:
+    if no_tb:
         print(f"{'\u2500'*80}")
-        print(f"  Shapes without T/A ratio ({len(no_ta)}):")
-        for e in no_ta:
+        print(f"  Shapes without T/B ratio ({len(no_tb)}):")
+        for e in no_tb:
             t = f"T={e['tensile']:.0f}" if e["tensile"] else "T=N/A"
-            a = f"A={e['api']:.0f}" if e["api"] else "A=N/A"
             b = f"B={e['bench']:.0f}" if e["bench"] else "B=N/A"
-            t_time = _fmt_time(e["tensile_secs"])
+            a = f"A={e['api']:.0f}" if e["api"] else "A=N/A"
             print(f"    {e['model']:<25} mbs={e['mbs']:>2}  {e['layer']:<20} "
-                  f"[{e['phase']}]  {t} {a} {b}  ({t_time})")
+                  f"[{e['phase']}]  {t} {a} {b}")
 
 
 if __name__ == "__main__":
