@@ -8,6 +8,14 @@ Estimates the total combinatorial search space.
 Usage:
   python3 analyze_production_library.py
   python3 analyze_production_library.py --logic-dir /path/to/Logic/asm_full/gfx950/Equality
+  python3 analyze_production_library.py --logic-dir tmp_rebuild/rocm-libraries/projects/hipblaslt/library/src/amd_detail/rocblaslt/src/Tensile/Logic/asm_full/aquavanjaram/gfx942/Equality
+
+  python3 analyze_production_library.py --file tmp_rebuild/rocm-libraries/projects/hipblaslt/library/src/amd_detail/rocblaslt/src/Tensile/Logic/asm_full/gfx950/Equality/gfx950_Cijk_Ailk_Bjlk_BBS_BH_BiasSB_HAS_SAV_UserArgs.yaml
+ # 48,448,880,366,321,664
+  python3 analyze_production_library.py --file tmp_rebuild/rocm-libraries/projects/hipblaslt/library/src/amd_detail/rocblaslt/src/Tensile/Logic/asm_full/aquavanjaram/gfx942/Equality/aquavanjaram_Cijk_Ailk_Bjlk_BBS_BH_Bias_HAS_SAV_UserArgs.yaml
+ # 112,140,288
+  python3 analyze_production_library.py --file tmp_rebuild/rocm-libraries/projects/hipblaslt/library/src/amd_detail/rocblaslt/src/Tensile/Logic/asm_full/aquavanjaram/gfx942/Equality/aquavanjaram_Cijk_Ailk_Bjlk_BBS_BH_UserArgs.yaml
+ #  6,742,112,993,280
 """
 
 import argparse
@@ -24,7 +32,7 @@ DEFAULT_LOGIC_DIR = (
 )
 
 FIELDS = [
-    "MatrixInstruction", "DepthU", "TransposeLDS",
+    "MIBlock", "DepthU", "TransposeLDS",
     "DirectToLdsA", "DirectToLdsB",
     "NonTemporalA", "NonTemporalB", "NonTemporalD",
     "StaggerU", "StaggerUStride", "StaggerUMapping",
@@ -47,20 +55,27 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--logic-dir", type=str, default=str(DEFAULT_LOGIC_DIR),
                         help="Path to Equality YAML directory")
+    parser.add_argument("--file", type=str, default=None,
+                        help="Analyze a single YAML file instead of the whole directory")
     args = parser.parse_args()
 
-    logic_dir = args.logic_dir
-    if not os.path.isdir(logic_dir):
-        print(f"ERROR: {logic_dir} not found")
-        return
+    if args.file:
+        if not os.path.isfile(args.file):
+            print(f"ERROR: {args.file} not found")
+            return
+        yaml_files = [args.file]
+        print(f"Analyzing: {os.path.basename(args.file)}")
+    else:
+        logic_dir = args.logic_dir
+        if not os.path.isdir(logic_dir):
+            print(f"ERROR: {logic_dir} not found")
+            return
+        yaml_files = [os.path.join(logic_dir, f) for f in sorted(os.listdir(logic_dir)) if f.endswith(".yaml")]
 
     values = defaultdict(lambda: defaultdict(int))
     total_kernels = 0
 
-    for fname in sorted(os.listdir(logic_dir)):
-        if not fname.endswith(".yaml"):
-            continue
-        fpath = os.path.join(logic_dir, fname)
+    for fpath in yaml_files:
         with open(fpath) as f:
             for line in f:
                 line = line.strip()
