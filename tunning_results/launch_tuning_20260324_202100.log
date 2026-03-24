@@ -1,0 +1,72 @@
+  [TODO] DeepSeek-V2-Lite: skipping attention shapes — MLA projections need real profiling to determine GEMM dims
+  [TODO] DeepSeek-V3: skipping attention shapes — MLA projections need real profiling to determine GEMM dims
+Tensile working directory: /workspace/lorri/hipblaslt-tunning-helper/tmp_rebuild/rocm-libraries/projects/hipblaslt/tensilelite
+  rocisa lib: /workspace/lorri/hipblaslt-tunning-helper/tmp_rebuild/rocm-libraries/projects/hipblaslt/tensilelite/build_tmp/tensilelite/rocisa/lib
+Parallel mode: 8 GPUs [0, 1, 2, 3, 4, 5, 6, 7]
+
+[1/987] [GPU0] Llama-3.1-70B lm_head [fwd]  MBS=4 M=32768 N=128256 K=8192 (TNN) [bf16]
+────────────────────────────────────────────────────────────
+    [origami] pruned MI9: 240 -> 11  (top 10 tiles)
+
+[2/987] [GPU1] Llama-3.1-70B lm_head [grad_a]  MBS=4 M=32768 N=8192 K=128256 (NNN) [bf16]
+────────────────────────────────────────────────────────────
+    [origami] pruned MI9: 240 -> 10  (top 10 tiles)
+
+[3/987] [GPU2] Llama-3.1-70B lm_head [grad_b]  MBS=4 M=128256 N=8192 K=32768 (NTN) [bf16]
+────────────────────────────────────────────────────────────
+    [origami] pruned MI9: 240 -> 11  (top 10 tiles)
+  [1/987] [GPU0] YAML: Llama-3.1-70B_lm_head_mbs4_fwd_TNN_M32768_N128256_K8192.yaml  (11 MI configs, RotBuf=0 MB)
+  [2/987] [GPU1] YAML: Llama-3.1-70B_lm_head_mbs4_grad_a_NNN_M32768_N8192_K128256.yaml  (10 MI configs, RotBuf=0 MB)
+  [3/987] [GPU2] YAML: Llama-3.1-70B_lm_head_mbs4_grad_b_NTN_M128256_N8192_K32768.yaml  (11 MI configs, RotBuf=0 MB)
+
+[4/987] [GPU3] Llama-3.1-70B attn_qkv [fwd]  MBS=4 M=32768 N=10240 K=8192 (TNN) [bf16]
+────────────────────────────────────────────────────────────
+    [origami] pruned MI9: 240 -> 11  (top 10 tiles)
+
+[5/987] [GPU4] Llama-3.1-70B attn_qkv [grad_a]  MBS=4 M=32768 N=8192 K=10240 (NNN) [bf16]  [SKIP — cached]
+  >> Tensile=1235.1 | API=1407.7 | Bench=1243.2
+  [4/987] [GPU3] YAML: Llama-3.1-70B_attn_qkv_mbs4_fwd_TNN_M32768_N10240_K8192.yaml  (11 MI configs, RotBuf=0 MB)
+
+[6/987] [GPU5] Llama-3.1-70B attn_qkv [grad_b]  MBS=4 M=10240 N=8192 K=32768 (NTN) [bf16]  [SKIP — cached]
+  >> Tensile=1231.2 | API=1381.7 | Bench=1248.3
+
+[9/987] [GPU5] Llama-3.1-70B attn_q+attn_out [grad_b]  MBS=4 M=8192 N=8192 K=32768 (NTN) [bf16]  [SKIP — cached]
+  >> Tensile=1236.9 | API=1432.5 | Bench=1264.0
+
+[7/987] [GPU6] Llama-3.1-70B attn_q+attn_out [fwd]  MBS=4 M=32768 N=8192 K=8192 (TNN) [bf16]
+────────────────────────────────────────────────────────────
+    [origami] pruned MI9: 240 -> 11  (top 10 tiles)
+
+[10/987] [GPU7] Llama-3.1-70B attn_k [fwd]  MBS=4 M=32768 N=1024 K=8192 (TNN) [bf16]
+────────────────────────────────────────────────────────────
+    [origami] pruned MI9: 240 -> 10  (top 10 tiles)
+  [7/987] [GPU6] YAML: Llama-3.1-70B_attn_q+attn_out_mbs4_fwd_TNN_M32768_N8192_K8192.yaml  (11 MI configs, RotBuf=0 MB)
+
+[8/987] [GPU4] Llama-3.1-70B attn_q+attn_out [grad_a]  MBS=4 M=32768 N=8192 K=8192 (NNN) [bf16]  [SKIP — cached]
+  >> Tensile=1225.2 | API=1462.7 | Bench=1259.3
+
+[12/987] [GPU4] Llama-3.1-70B attn_k [grad_b]  MBS=4 M=1024 N=8192 K=32768 (NTN) [bf16]  [SKIP — cached]
+  >> Tensile=1087.8 | API=1207.8 | Bench=1120.0
+
+[13/987] [GPU4] Llama-3.1-70B mlp_gate_up [fwd]  MBS=4 M=32768 N=57344 K=8192 (TNN) [bf16]
+────────────────────────────────────────────────────────────
+    [origami] pruned MI9: 240 -> 11  (top 10 tiles)
+
+[11/987] [GPU5] Llama-3.1-70B attn_k [grad_a]  MBS=4 M=32768 N=8192 K=1024 (NNN) [bf16]  [SKIP — cached]
+  >> Tensile=999.3 | API=1122.1 | Bench=1017.9
+
+[14/987] [GPU5] Llama-3.1-70B mlp_gate_up [grad_a]  MBS=4 M=32768 N=8192 K=57344 (NNN) [bf16]
+────────────────────────────────────────────────────────────
+    [origami] pruned MI9: 240 -> 10  (top 10 tiles)
+  [10/987] [GPU7] YAML: Llama-3.1-70B_attn_k_mbs4_fwd_TNN_M32768_N1024_K8192.yaml  (10 MI configs, RotBuf=0 MB)
+  Tensile: running ...  (log: Llama-3.1-70B_attn_qkv_mbs4_fwd_TNN_M32768_N10240_K8192.tensile.log)
+  [14/987] [GPU5] YAML: Llama-3.1-70B_mlp_gate_up_mbs4_grad_a_NNN_M32768_N8192_K57344.yaml  (10 MI configs, RotBuf=0 MB)
+  [13/987] [GPU4] YAML: Llama-3.1-70B_mlp_gate_up_mbs4_fwd_TNN_M32768_N57344_K8192.yaml  (11 MI configs, RotBuf=0 MB)
+  Tensile: running ...  (log: Llama-3.1-70B_attn_q+attn_out_mbs4_fwd_TNN_M32768_N8192_K8192.tensile.log)
+  Tensile: running ...  (log: Llama-3.1-70B_attn_k_mbs4_fwd_TNN_M32768_N1024_K8192.tensile.log)
+  Tensile:      0s                                                                Tensile:      0s                                                                Tensile:      0s                                                                Tensile: running ...  (log: Llama-3.1-70B_lm_head_mbs4_grad_b_NTN_M128256_N8192_K32768.tensile.log)
+  Tensile:      0s                                                                Tensile: running ...  (log: Llama-3.1-70B_lm_head_mbs4_fwd_TNN_M32768_N128256_K8192.tensile.log)
+  Tensile: running ...  (log: Llama-3.1-70B_mlp_gate_up_mbs4_fwd_TNN_M32768_N57344_K8192.tensile.log)
+  Tensile:      0s                                                                Tensile:      0s                                                                Tensile: running ...  (log: Llama-3.1-70B_lm_head_mbs4_grad_a_NNN_M32768_N8192_K128256.tensile.log)
+  Tensile: running ...  (log: Llama-3.1-70B_mlp_gate_up_mbs4_grad_a_NNN_M32768_N8192_K57344.tensile.log)
+  Tensile:      0s                                                                Tensile:      0s                                                                Tensile:     30s  s for TLUB == UnrollMajorLDSB, using nonDirectToLds version   Tensile:     30s  s for TLUB == UnrollMajorLDSB, using nonDirectToLds version   Tensile:     30s  s for TLUB == UnrollMajorLDSB, using nonDirectToLds version   Tensile:     30s  dicesLD': 4, 'IndexAssignmentsLD': [4, 5, 6, 7], 'TileAwareS  Tensile:     30s  == UnrollMajorLDSA, using nonDirectToLds version instead      Tensile:     30s  ': False, 'IndexAssignmentsMetadata': [3, 0, 2], 'AssignedDe  Tensile:     30s  ile::WARNING: can't use DirectToLds with b64 buffer load, us  Tensile:     30s  icesLD': 4, 'IndexAssignmentsLD': [4, 5, 6, 7], 'TileAwareSe  Tensile:     60s  Writing assembly kernels: Launching 384 threads for 552 task  Tensile:     60s  6it/s]Finding unique solutions:  12%|█▏        | 1188/9888   Tensile:     60s  54%|█████▍    | 4920/9096 [00:08<00:10, 412.11it/s]Finding   Tensile:     60s  buildSourceCodeObjectFile time (s): 7.59                      Tensile:     60s  1739/9888 [00:02<00:16, 503.79it/s]Finding unique solutions  Tensile:     60s  | 1647/9888 [00:02<00:19, 425.06it/s]Finding unique solutio  Tensile:     60s  [00:09<00:11, 530.57it/s]Finding unique solutions:  47%|███  Tensile:     60s  DA2_MI16_16_32_1_MLDS163840_MO40_MPM0_MGRIPM1_NR0_NTn1_NTA0_  Tensile:     90s  buildSourceCodeObjectFile time (s): 8.20                      Tensile:     90s  buildSourceCodeObjectFile time (s): 6.96                      Tensile:     90s  buildSourceCodeObjectFile time (s): 9.55                      Tensile:     90s  # Actual Solutions: 3944 / 6336 after KernelWriter            Tensile:     90s  buildSourceCodeObjectFile time (s): 7.03                      Tensile:     90s  buildSourceCodeObjectFile time (s): 6.96                      Tensile:     90s  buildSourceCodeObjectFile time (s): 7.37                      Tensile:     90s  buildSourceCodeObjectFile time (s): 9.32                      Tensile:    120s  # Actual Solutions: 6800 / 9888 after KernelWriter            Tensile:    120s  # Actual Solutions: 6800 / 9888 after KernelWriter            Tensile:    120s  # Actual Solutions: 6936 / 9096 after KernelWriter            Tensile:    120s  0,0/0,3/3943,Contraction_l_Ailk_Bjlk_Cijk_Dijk,"(8192,128256  Tensile:    120s  # Actual Solutions: 6800 / 9888 after KernelWriter            Tensile:    120s  # Actual Solutions: 6800 / 9888 after KernelWriter            Tensile:    120s  # Actual Solutions: 8632 / 11520 after KernelWriter           Tensile:    120s  # Actual Solutions: 8632 / 11520 after KernelWriter           Tensile:    150s  0,0/0,60/6799,Solution Skipped (slow or doing restoration):   Tensile:    150s  # Actual Solutions: 6800 / 9888 after KernelWriter            Tensile:    150s  + /workspace/lorri/hipblaslt-tunning-helper/tmp_rebuild/rocm  Tensile:    150s  0,0/0,10/3943,Contraction_l_Ailk_Bjlk_Cijk_Dijk,"(8192,12825  Tensile:    150s  # Actual Solutions: 6800 / 9888 after KernelWriter            Tensile:    150s  0,0/0,3/6799,Contraction_l_Alik_Bljk_Cijk_Dijk,"(57344,32768  Tensile:    150s  Log level: Debug                                              Tensile:    150s  0,0/0,0/8631,Contraction_l_Ailk_Bljk_Cijk_Dijk,"(8192,32768,  Tensile:    180s  0,0/0,146/6799,Solution Skipped (slow or doing restoration):  Tensile:    180s  0,0/0,90/6799,Solution Skipped (slow or doing restoration):   Tensile:    180s  0,0/0,694/6935,Solution Skipped (slow or doing restoration):  Tensile:    180s  0,0/0,16/3943,Contraction_l_Ailk_Bjlk_Cijk_Dijk,"(8192,12825  Tensile:    180s  0,0/0,2/6799,Contraction_l_Alik_Bljk_Cijk_Dijk,"(128256,3276  Tensile:    180s  0,0/0,14/6799,Solution Skipped (slow or doing restoration):   Tensile:    180s  0,0/0,5/8631,Contraction_l_Ailk_Bljk_Cijk_Dijk,"(8192,32768,  Tensile:    180s  0,0/0,15/8631,Contraction_l_Ailk_Bljk_Cijk_Dijk,"(8192,32768  Tensile:    210s  0,0/0,242/6799,Solution Skipped (slow or doing restoration):  Tensile:    210s  0,0/0,200/6799,Solution Skipped (slow or doing restoration):  Tensile:    210s  0,0/0,1420/6935,Contraction_l_Alik_Bljk_Cijk_Dijk,"(1024,327  Tensile:    210s  0,0/0,23/3943,Contraction_l_Ailk_Bjlk_Cijk_Dijk,"(8192,12825  Tensile:    210s  0,0/0,8/6799,Solution Skipped (slow or doing restoration): C  Tensile:    210s  0,0/0,24/6799,Solution Skipped (slow or doing restoration):   Tensile:    210s  0,0/0,11/8631,Contraction_l_Ailk_Bljk_Cijk_Dijk,"(8192,32768  Tensile:    210s  0,0/0,29/8631,Contraction_l_Ailk_Bljk_Cijk_Dijk,"(8192,32768  Tensile:    240s  0,0/0,344/6799,Solution Skipped (slow or doing restoration):  Tensile:    240s  0,0/0,330/6799,Solution Skipped (slow or doing restoration):  Tensile:    240s  0,0/0,2142/6935,Solution Skipped (slow or doing restoration)  Tensile:    240s  0,0/0,29/3943,Contraction_l_Ailk_Bjlk_Cijk_Dijk,"(8192,12825  Tensile:    240s  0,0/0,18/6799,Solution Skipped (slow or doing restoration):   Tensile:    240s  0,0/0,36/6799,Solution Skipped (slow or doing restoration):   Tensile:    240s  0,0/0,18/8631,Contraction_l_Ailk_Bljk_Cijk_Dijk,"(8192,32768  Tensile:    240s  0,0/0,44/8631,Contraction_l_Ailk_Bljk_Cijk_Dijk,"(8192,32768  Tensile:    270s  0,0/0,438/6799,Contraction_l_Alik_Bljk_Cijk_Dijk,"(10240,327  Tensile:    270s  0,0/0,450/6799,Contraction_l_Alik_Bljk_Cijk_Dijk,"(8192,3276  Tensile:    270s  0,0/0,2918/6935,Solution Skipped (slow or doing restoration)  Tensile:    270s  0,0/0,36/3943,Contraction_l_Ailk_Bjlk_Cijk_Dijk,"(8192,12825  Tensile:    270s  0,0/0,26/6799,Solution Skipped (slow or doing restoration):   Tensile:    270s  0,0/0,48/6799,Solution Skipped (slow or doing restoration):   Tensile:    270s  0,0/0,24/8631,Contraction_l_Ailk_Bljk_Cijk_Dijk,"(8192,32768  Tensile:    270s  0,0/0,59/8631,Contraction_l_Ailk_Bljk_Cijk_Dijk,"(8192,32768  Tensile:    300s  0,0/0,529/6799,Contraction_l_Alik_Bljk_Cijk_Dijk,"(10240,327  Tensile:    300s  0,0/0,568/6799,Contraction_l_Alik_Bljk_Cijk_Dijk,"(8192,3276  Tensile:    300s  0,0/0,3630/6935,Solution Skipped (slow or doing restoration)  Tensile:    300s  0,0/0,44/3943,Contraction_l_Ailk_Bjlk_Cijk_Dijk,"(8192,12825  Tensile:    300s  0,0/0,32/6799,Solution Skipped (slow or doing restoration):   Tensile:    300s  0,0/0,62/6799,Solution Skipped (slow or doing restoration):   Tensile:    300s  0,0/0,31/8631,Contraction_l_Ailk_Bljk_Cijk_Dijk,"(8192,32768  Tensile:    300s  0,0/0,75/8631,Contraction_l_Ailk_Bljk_Cijk_Dijk,"(8192,32768  Tensile:    330s  0,0/0,623/6799,Contraction_l_Alik_Bljk_Cijk_Dijk,"(10240,327  Tensile:    330s  0,0/0,694/6799,Solution Skipped (slow or doing restoration):  Tensile:    330s  0,0/0,4388/6935,Solution Skipped (slow or doing restoration)  Tensile:    330s  0,0/0,51/3943,Contraction_l_Ailk_Bjlk_Cijk_Dijk,"(8192,12825  Tensile:    330s  0,0/0,38/6799,Solution Skipped (slow or doing restoration):   Tensile:    330s  0,0/0,74/6799,Solution Skipped (slow or doing restoration):   Tensile:    330s  0,0/0,37/8631,Contraction_l_Ailk_Bljk_Cijk_Dijk,"(8192,32768  Tensile:    330s  0,0/0,91/8631,Contraction_l_Ailk_Bljk_Cijk_Dijk,"(8192,32768  Tensile:    360s  0,0/0,722/6799,Solution Skipped (slow or doing restoration):  Tensile:    360s  0,0/0,814/6799,Solution Skipped (slow or doing restoration):  Tensile:    360s  0,0/0,5119/6935,Contraction_l_Alik_Bljk_Cijk_Dijk,"(1024,327  Tensile:    360s  0,0/0,61/3943,Solution Skipped (slow or doing restoration):   Tensile:    360s  0,0/0,48/6799,Solution Skipped (slow or doing restoration):   Tensile:    360s  0,0/0,86/6799,Solution Skipped (slow or doing restoration):   Tensile:    360s  0,0/0,44/8631,Contraction_l_Ailk_Bljk_Cijk_Dijk,"(8192,32768  Tensile:    360s  0,0/0,107/8631,Contraction_l_Ailk_Bljk_Cijk_Dijk,"(8192,3276  Tensile:    390s  0,0/0,822/6799,Solution Skipped (slow or doing restoration):  Tensile:    390s  0,0/0,942/6799,Solution Skipped (slow or doing restoration):  Tensile:    390s  0,0/0,5860/6935,Solution Skipped (slow or doing restoration)  Tensile:    390s  0,0/0,73/3943,Solution Skipped (slow or doing restoration):   Tensile:    390s  0,0/0,56/6799,Solution Skipped (slow or doing restoration):   Tensile:    390s  0,0/0,98/6799,Solution Skipped (slow or doing restoration):   Tensile:    390s  0,0/0,50/8631,Contraction_l_Ailk_Bljk_Cijk_Dijk,"(8192,32768  Tensile:    390s  0,0/0,124/8631,Solution Skipped (slow or doing restoration):

@@ -513,6 +513,37 @@ key-value pairs. Common abbreviations:
 requirement." The distinction only matters at `AFC8` or higher where the kernel
 assumes M is a multiple of that value for performance.
 
+### MI4 → MI9 Expansion (MatrixInstruction Fields)
+
+Tensile YAML templates specify MatrixInstruction as 4 elements (MI4):
+`[mi_M, mi_N, mi_K, mi_B]` — e.g. `[16, 16, 32, 1]`.
+
+`run_shapes.py` expands each MI4 into many MI9 tile configurations:
+`[mi_M, mi_N, mi_K, mi_B, bm, tt0, tt1, wm, wn]`
+
+| Index | Field | Name | Description |
+|-------|-------|------|-------------|
+| 0 | mi_M | MFMA M | MFMA instruction M dimension (16 or 32) |
+| 1 | mi_N | MFMA N | MFMA instruction N dimension (16 or 32) |
+| 2 | mi_K | MFMA K | MFMA instruction K dimension (32 for BF16) |
+| 3 | mi_B | MFMA Blocks | Number of blocks per instruction (usually 1) |
+| 4 | bm | Block Multiple | Power-of-2 multiplier from mi_B. Scales M tile. |
+| 5 | tt0 | ThreadTile0 | Wave tile count in M direction (1–16) |
+| 6 | tt1 | ThreadTile1 | Wave tile count in N direction (1–16) |
+| 7 | wm | WaveGroup M | Waves in M direction (from combos: 1, 2, or 4) |
+| 8 | wn | WaveGroup N | Waves in N direction (from combos: 4, 1, or 2) |
+
+Macro tile dimensions:
+- `MacroTile0 = mi_M × bm × tt0 × wm`
+- `MacroTile1 = mi_N × tt1 × wn`
+
+Example: `[16, 16, 32, 1, 1, 8, 8, 2, 2]`
+→ MT0 = 16×1×8×2 = 256, MT1 = 16×8×2 = 256 → **MT256×256**
+→ Kernel name: `MIWT8_8` (wave tile 8×8), `WG32_8_1` (32×8 threads = 2×2 waves)
+
+Origami pruning (`--origami-top-n N`) scores all MI9 tiles and keeps the top N
+predicted performers, dramatically reducing the search space.
+
 ### NonTemporalD Was Missing from Search Space (Critical Finding)
 
 Analysis of 79 completed shapes (Llama-3.1-70B) revealed a systematic mismatch:
