@@ -17,8 +17,8 @@
 | Method | TFLOPS | Time (us) | vs Bench | vs API |
 |--------|-------:|----------:|---------:|-------:|
 | **Tensile tuned** | N/A | N/A | N/A | N/A |
-| **API bench (installed)** | 1001.49 | 137.23 | 114.1% | — |
-| **hipblaslt-bench (stock)** | 877.87 | 156.56 | — | — |
+| **API bench (installed)** | 969.91 | 141.70 | 113.7% | — |
+| **hipblaslt-bench (stock)** | 853.02 | 161.12 | — | — |
 
 ## Kernels
 
@@ -29,7 +29,7 @@
 ## hipblaslt-bench
 
 ```bash
-/opt/rocm/bin/hipblaslt-bench -m 8192 -n 8192 -k 1024 --precision bf16_r --compute_type f32_r --transA N --transB N -i 50 -j 30 --rotating 1800 --print_kernel_info
+/opt/rocm/bin/hipblaslt-bench -m 8192 -n 8192 -k 1024 --precision bf16_r --compute_type f32_r --transA N --transB N -i 50 -j 30 --rotating 1800 --use_gpu_timer --flush --initialization trig_float --print_kernel_info
 ```
 
 <details><summary>Raw output</summary>
@@ -45,7 +45,7 @@ maxGridDimX 2147483647, sharedMemPerBlock 163.8 KB, maxThreadsPerBlock 1024, war
 Rotating buffer 1800 MiB. Needed Size: 160 MiB. Needed block count: 12 (Capped to max iters: 50)
 Is supported 1 / Total solutions: 1
 [0]:transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us
-    N,N,0,1,8192,8192,1024,1,8192,8388608,0,1024,8388608,8192,67108864,8192,67108864,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,bf16_r,bf16_r,1800,0,0,877868,998.02,156.56
+    N,N,0,1,8192,8192,1024,1,8192,8388608,0,1024,8388608,8192,67108864,8192,67108864,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,bf16_r,bf16_r,1800,1,1,853024,969.776,161.12
     --Solution index: 300658
     --Solution name:  Cijk_Ailk_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x256x64_MI16x16x1_CMS_SN_LDSB0_AFC1_AFEM1_AFEM1_ASEM1_CLR1_CADS0_DTLA1_DTLB1_DTVA0_DTVB0_EPS0_FDSI0_GRPM1_GRVWA8_GRVWB8_GSU0_GSUAMB_GSUC0_GSUWGMRR0_GLS0_ISA950_IU1_K1_LBSPPA4096_LBSPPB1024_LBSPPM0_LPA0_LPB16_LPM0_LRVW8_LWPMn1_MIAV0_MIWT8_8_MO40_NTn1_NTA0_NTB0_NTC0_NTD4_NTM0_NEPBS0_NLCA1_NLCB1_ONLL1_PGR2_PLR1_PKA1_SIA3_SS1_SU0_SUM0_SUS128_SPO0_SRVW0_SSO0_SVW8_SK3_SKXCCM0_TLDS1_ULSGRO0_USL1_UIOFGRO0_USFGRO0_VSn1_VWA8_VWB8_WSGRA0_WSGRB0_WS64_WG32_8_1_WGM16_WGMXCC2_WGMXCCGn1
     --kernel name:    Cijk_Ailk_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x256x64_MI16x16x1_CMS_SN_LDSB0_AFC1_AFEM1_AFEM1_ASEM1_CLR1_CADS0_DTLA1_DTLB1_DTVA0_DTVB0_EPS0_FDSI0_GRPM1_GRVWA8_GRVWB8_GSU0_GSUAMB_GLS0_ISA950_IU1_K1_LBSPPA4096_LBSPPB1024_LBSPPM0_LPA0_LPB16_LPM0_LRVW8_LWPMn1_MIAV0_MIWT8_8_MO40_NTn1_NTA0_NTB0_NTC0_NTD4_NTM0_NEPBS0_NLCA1_NLCB1_ONLL1_PGR2_PLR1_PKA1_SIA3_SS1_SPO0_SRVW0_SSO0_SVW8_SK3_SKXCCM0_TLDS1_ULSGRO0_USL1_UIOFGRO0_USFGRO0_VSn1_VWA8_VWB8_WSGRA0_WSGRB0_WS64_WG32_8_1

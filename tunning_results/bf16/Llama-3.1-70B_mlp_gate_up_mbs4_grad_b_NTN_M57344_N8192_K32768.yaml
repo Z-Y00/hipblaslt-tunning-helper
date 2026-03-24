@@ -2,12 +2,12 @@ TestParameters:
   marks: [skip-gfx900, skip-gfx906, skip-gfx908, skip-gfx90a, skip-gfx940, skip-gfx941, skip-gfx942, skip-gfx1010, skip-gfx1011, skip-gfx1012, skip-gfx1030, skip-gfx1100, skip-gfx1101, skip-gfx1102, skip-gfx1200, skip-gfx1201] # not supported by arch
 
 GlobalParameters:
-  SkipSlowSolutionRatio: 0.5
+  SkipSlowSolutionRatio: 0.7
   NumElementsToValidate: 128 # skip full validation for fast tuning
-  NumWarmups: 30
+  NumWarmups: 20
   NumBenchmarks: 1
   SyncsPerBenchmark: 1
-  EnqueuesPerSync: 50
+  EnqueuesPerSync: 30
   CSVExportWinner: 1 # Lorri: save the winner
   CSVMergeSameProblemID: 1
   Device: 0 # Lorri: must do everything on the same GPU, avoid GPU 2 GPU difference
@@ -20,8 +20,7 @@ GlobalParameters:
   MergeFiles: False
   KernelTime: True
   MaxWorkspaceSize: 13421772800
-  DataInitTypeA: 3
-  DataInitTypeB: 3
+  DataInitTypeAB: 12 # TrigSin — matches upstream tuning_template.yaml and hipblaslt-bench --initialization trig_float
   #DataInitTypeC: 21
   DataInitTypeAlpha: 1
   DataInitTypeBeta: 0
@@ -89,29 +88,31 @@ BenchmarkProblems:
         - LocalReadVectorWidth: [-1]
         - ScheduleIterAlg: [3]
           #        - ExpandPointerSwap: [0]
-        - TransposeLDS: [0, 1] #0,1
+        - TransposeLDS: [0, 1]
         - DirectToLds: [0, 1]
         - LdsBlockSizePerPadA: [-1]
         - LdsBlockSizePerPadB: [-1]
         - LdsPadA: [-1]
         - LdsPadB: [-1]
+        - NonTemporalD: [0,4] # both are about 1/4 in rocm-libraries/projects/hipblaslt/library/src/amd_detail/rocblaslt/src/Tensile/Logic/asm_full/gfx950/Equality/
         # - NonTemporalB: [0]
-        - NonTemporalB: [0,4] # Lorri: allow non-temporal load for B to bypass cache coherency, we have to try both at tunning based on different gemm size
-        - StaggerU: [0]
-        - StaggerUStride: [16]
+        - NonTemporalB: [0,1] # Lorri: allow non-temporal load for B to bypass cache coherency, we have to try both at tunning based on different gemm size
+        - StaggerU: [0, 8, 16] # add possible options from tmp_rebuild/rocm-libraries/projects/hipblaslt/library/src/amd_detail/rocblaslt/src/Tensile/Logic/asm_full/gfx950/Equality/gfx950_Cijk_Ailk_Bjlk_S_B_BiasS_HAS_SAV_UserArgs.yaml
+        - StaggerUStride: [0, 64, 128, 256] # same as above
         - WorkGroupMappingXCC: [1, 8]
         - WorkGroupMappingXCCGroup: [-1]
-        - 1LDSBuffer: [-1]
-        - GlobalSplitU: [-1] # see knowledge.md
-        - GlobalSplitUAlgorithm: ["MultipleBufferSingleKernel"]
-        #- PreloadKernArgs: [0, 1]
+        - 1LDSBuffer: [0,1] # both shown in the above mentioned gfx950 yaml folder, and the default -1 seems not always the best, as it will use 1 only when exceed max size
+        - GlobalSplitU: [0]
+        - GlobalSplitUAlgorithm: ["MultipleBuffer"] # same as above mentioned gfx950 yaml folder
+        - PreloadKernArgs: [true] # same as above mentioned gfx950 yaml folder
+        - ClusterLocalRead: [0,1] # both shown in the above mentioned gfx950 yaml folder
         - StreamK: [0, 3]
         - SourceSwap: [1]
       BenchmarkJoinParameters:
       BenchmarkFinalParameters:
         - ProblemSizes: # Lorri: see https://amd.atlassian.net/wiki/spaces/~7120202add2b96de67481bbcfa5e99f875033a/pages/833108349/Single+Grouped+GEMM+kernel
           - Exact: [8192, 57344, 1, 32768]
-        - BiasTypeArgs: ['S','B'] # Lorri: f32_r and bf16_r for bias type, more robust matching
+        - BiasTypeArgs: ['S'] # Lorri: we only keep one for profiling, as otherwise we will x2 the runtime
         - ActivationArgs:
           - [Enum: none]
 LibraryLogic: # Lorri, see hipblaslt/tensilelite/Tensile/Tests/common/gemm/gfx950/xfp32.yaml

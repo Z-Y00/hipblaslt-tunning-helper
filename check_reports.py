@@ -152,10 +152,11 @@ def main():
         print(f"  {'':>8} \u2514{'\u2500'*BAR_WIDTH}")
         print()
 
-    for label, _ in BUCKETS:
+    for label, pred in BUCKETS:
         items = bucketed.get(label, [])
         print(f"  {label}:  {len(items)} shapes")
-        if items:
+        # Skip per-shape details for the 95-100% bucket (expected range, too many to list)
+        if items and not (95 < items[0]["tb_ratio"] <= 100):
             by_model = defaultdict(list)
             for e in items:
                 by_model[e["model"]].append(e)

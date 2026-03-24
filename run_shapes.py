@@ -82,7 +82,7 @@ _GFX950_LLC_MB = 256
 _MIN_ROTATIONS = 5
 _MAX_ROTATING_MB = 8192
 _FP8_ROTATION_SCALE = 5
-_TENSILE_OVERHEAD_FACTOR = 1.25  # Tensile client reserves ~15-17% for alignment/metadata
+_TENSILE_OVERHEAD_FACTOR = 1.5  # Tensile client reserves ~12.5% overhead + needs extra copies beyond _MIN_ROTATIONS
 
 
 def compute_rotating_buffer_mb(M, N, K, dtype="bf16"):
@@ -1098,13 +1098,13 @@ def _process_one_shape(shape, idx, total, header, footer, out_dir, args, device)
     tensile_result = None
     if args.run and not args.skip_tensile:
         ok = run_tensile(yaml_path, case_dir, device=device)
-        if ok:
-            tensile_result = parse_tensile_csv(case_dir)
-            if tensile_result:
-                _thread_print(f"  {tag} Tensile winner: {tensile_result['tflops']:.1f} TFLOPS  "
-                              f"({tensile_result['time_us']:.1f} µs)")
-            else:
-                _thread_print(f"  {tag} Tensile: no valid winner found")
+        tensile_result = parse_tensile_csv(case_dir)
+        if tensile_result:
+            rescued = "" if ok else " (rescued from failed run)"
+            _thread_print(f"  {tag} Tensile winner: {tensile_result['tflops']:.1f} TFLOPS  "
+                          f"({tensile_result['time_us']:.1f} µs){rescued}")
+        else:
+            _thread_print(f"  {tag} Tensile: no valid winner found")
     elif args.compare_only:
         tensile_result = parse_tensile_csv(case_dir)
 

@@ -29,6 +29,30 @@ commands to match the BLAS convention.
 """
 
 ###############################################################################
+# Regression test cases — manually specified shapes to tune first.
+#
+# Each entry is a dict with:
+#   model:   str   — model name (for reporting)
+#   layer:   str   — layer name (for reporting)
+#   mbs:     int   — micro batch size (for reporting)
+#   M, N, K: int   — PyTorch dimensions (run_shapes.py swaps M<->N for BLAS)
+#   trans_a: bool  — True=T, False=N
+#   trans_b: bool  — True=T, False=N
+#   phase:   str   — "fwd", "grad_a", or "grad_b"
+#
+# Example:
+#   {"model": "Llama-3.1-70B", "layer": "lm_head", "mbs": 4, "phase": "fwd",
+#    "M": 32768, "N": 128256, "K": 8192, "trans_a": True, "trans_b": False},
+#
+RegressionTestCases = [
+    # Add cases here — these will be tuned before auto-generated shapes.
+    # {"model": "Llama-3.1-70B-regression", "layer": "Case1", "mbs": 4, "phase": "NA",
+    # "M": 32768, "N":  57344, "K": 8192, "trans_a": True, "trans_b": False},
+    # {"model": "Llama-3.1-70B-regression", "layer": "Case2", "mbs": 4, "phase": "NA",
+    # "M": 32768, "N": 128256, "K":  8192, "trans_a": False, "trans_b": True},
+]
+
+###############################################################################
 # Batch sizes — per-model, derived from BF16 training benchmarks ±2.
 #
 # Source tables (Primus / Primus-TT BF16 rows):
@@ -53,6 +77,18 @@ BATCH_SIZE_LIST = list(range(1, 10))  # fallback default
 ###############################################################################
 
 DenseModelConfigs = {
+    # https://huggingface.co/meta-llama/Llama-3.1-70B/blob/main/config.json
+    # BF16 MBS=1 (Primus) + MBS=3 (Primus-TT) + MBS=6 (Llama-3.3-70B, same arch)
+    "Llama-3.1-70B": {
+        "seqlen": 8192,
+        "hidden_size": 8192,
+        "intermediate_size": 28672,
+        "vocab_size": 128256,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "batch_sizes": [4, 1, 2, 3, 5, 6, 7, 8], 
+    },
     # https://huggingface.co/meta-llama/Llama-2-7b/blob/main/config.json
     # BF16 MBS=10
     "Llama-2-7B": {
@@ -89,18 +125,7 @@ DenseModelConfigs = {
         "head_dim": 128,
         "batch_sizes": [2, 3, 4, 5, 6, 7, 8],
     },
-    # https://huggingface.co/meta-llama/Llama-3.1-70B/blob/main/config.json
-    # BF16 MBS=1 (Primus) + MBS=3 (Primus-TT) + MBS=6 (Llama-3.3-70B, same arch)
-    "Llama-3.1-70B": {
-        "seqlen": 8192,
-        "hidden_size": 8192,
-        "intermediate_size": 28672,
-        "vocab_size": 128256,
-        "num_attention_heads": 64,
-        "num_key_value_heads": 8,
-        "head_dim": 128,
-        "batch_sizes": [1, 2, 3, 4, 5, 6, 7, 8], 
-    },
+
     # https://huggingface.co/meta-llama/Llama-3.1-405B/blob/main/config.json
     # Not in BF16 benchmark table — keeping conservative range
     "Llama-3.1-405B": {
@@ -272,8 +297,10 @@ def gen_all_shapes(model_filter=None, include_bwd=True, quick_sweep=False):
     trans_a, trans_b) within the same model+mbs, merging layer names.
 
     If quick_sweep=True, only run BS=1 for each model (skip other batch sizes).
+
+    RegressionTestCases are always prepended first (tuned before everything else).
     """
-    shapes = []
+    shapes = list(RegressionTestCases)
     for name, cfg in DenseModelConfigs.items():
         if model_filter and model_filter.lower() not in name.lower():
             continue
