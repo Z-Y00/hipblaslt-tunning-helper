@@ -692,3 +692,53 @@ ScheduleIterAlg                     2  3(100%)
 
 Estimated theoretical search space: ~9×10²⁰ combinations (most invalid).
 The production library's 6,325 kernels represent a heavily curated subset.
+
+## Dumping ASM for a Production Kernel
+
+To disassemble a specific kernel from the installed hipBLASLt library:
+
+### 1. Find the .co file
+
+Production kernels are in `/opt/rocm/lib/hipblaslt/library/`. File naming:
+- `Cijk_Alik_Bljk` = TN (TransA=T, TransB=N) — used by `fwd` pass
+- `Cijk_Ailk_Bljk` = NN — used by `grad_a` pass
+- `Cijk_Ailk_Bjlk` = NT — used by `grad_b` pass
+- `BBS` = BF16 in/out, FP32 compute
+
+```bash
+ls /opt/rocm/lib/hipblaslt/library/*BB*Alik_Bljk*gfx950.co  # TN BF16 example
+```
+
+### 2. Unbundle the code object
+
+```bash
+/opt/rocm/lib/llvm/bin/clang-offload-bundler --type=o \
+  --targets=hipv4-amdgcn-amd-amdhsa--gfx950 \
+  --input="<path>.co" \
+  --output=/tmp/unbundled.co --unbundle
+```
+
+### 3. List kernel symbols
+
+```bash
+/opt/rocm/lib/llvm/bin/llvm-readelf -s /tmp/unbundled.co | grep 'FUNC.*<search_term>'
+```
+
+### 4. Get the kernel address range
+
+Find the kernel's start address and the next kernel's address:
+
+```bash
+/opt/rocm/lib/llvm/bin/llvm-readelf -s /tmp/unbundled.co | grep 'FUNC.*GLOBAL' | \
+  awk '{print $2}' | sort | grep -A1 '<kernel_addr>'
+```
+
+### 5. Disassemble
+
+```bash
+/opt/rocm/lib/llvm/bin/llvm-objdump -d --mcpu=gfx950 \
+  --start-address=0x<start> --stop-address=0x<end> \
+  /tmp/unbundled.co > kernel.asm
+```
+
+None of these steps require a GPU — it's all offline binary analysis.

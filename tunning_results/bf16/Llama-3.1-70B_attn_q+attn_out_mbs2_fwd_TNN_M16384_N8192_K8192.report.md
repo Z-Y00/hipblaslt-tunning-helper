@@ -1,26 +1,26 @@
-# Llama-3.1-70B — mlp_gate [fwd]
+# Llama-3.1-70B — attn_q+attn_out [fwd]
 
 | Parameter | Value |
 |-----------|-------|
 | Model | Llama-3.1-70B |
-| Layer | mlp_gate |
+| Layer | attn_q+attn_out |
 | Phase | fwd |
-| MBS | 1 |
+| MBS | 2 |
 | Trans (ABC) | TNN |
-| M | 8192 |
-| N | 28672 |
+| M | 16384 |
+| N | 8192 |
 | K | 8192 |
-| FLOPs | 3.848e+12 |
+| FLOPs | 2.199e+12 |
 
 ## Results
 
 | Method | TFLOPS | Time (us) | vs Bench | vs API |
 |--------|-------:|----------:|---------:|-------:|
-| **Tensile tuned** | 1240.26 | 3102.82 | 97.3% | 85.2% |
-| **API bench (installed)** | 1455.19 | 2644.52 | 114.2% | — |
-| **hipblaslt-bench (stock)** | 1274.12 | 3020.35 | — | — |
+| **Tensile tuned** | 1266.97 | 1735.65 | 100.0% | 86.2% |
+| **API bench (installed)** | 1469.10 | 1496.85 | 115.9% | — |
+| **hipblaslt-bench (stock)** | 1267.33 | 1735.17 | — | — |
 
-> **Tuned/API ratio (gate metric):** 85.23%
+> **Tuned/API ratio (gate metric):** 86.24%
 
 ## Kernels
 
@@ -31,7 +31,7 @@
 ## hipblaslt-bench
 
 ```bash
-/opt/rocm/bin/hipblaslt-bench -m 28672 -n 8192 -k 8192 --precision bf16_r --compute_type f32_r --transA T --transB N -i 50 -j 30 --rotating 0 --use_gpu_timer --flush --initialization trig_float --print_kernel_info
+/opt/rocm/bin/hipblaslt-bench -m 8192 -n 16384 -k 8192 --precision bf16_r --compute_type f32_r --transA T --transB N -i 50 -j 30 --rotating 0 --use_gpu_timer --flush --initialization trig_float --print_kernel_info
 ```
 
 <details><summary>Raw output</summary>
@@ -46,7 +46,7 @@ maxGridDimX 2147483647, sharedMemPerBlock 163.8 KB, maxThreadsPerBlock 1024, war
 
 Is supported 1 / Total solutions: 1
 [0]:transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us
-    T,N,0,1,28672,8192,8192,1,8192,234881024,0,8192,67108864,28672,234881024,28672,234881024,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,bf16_r,bf16_r,0,1,1,1.27412e+06,331.087,3020.35
+    T,N,0,1,8192,16384,8192,1,8192,67108864,0,8192,134217728,8192,134217728,8192,134217728,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,bf16_r,bf16_r,0,1,1,1.26733e+06,360.196,1735.17
     --Solution index: 302128
     --Solution name:  Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x256x64_MI16x16x1_CMS_SN_LDSB0_AFC1_AFEM1_AFEM1_ASEM1_CLR1_CADS0_DTLA1_DTLB1_DTVA0_DTVB0_EPS0_FDSI0_GRPM1_GRVWA8_GRVWB8_GSU0_GSUAMB_GSUC0_GSUWGMRR0_GLS0_ISA950_IU1_K1_LBSPPA1024_LBSPPB1024_LBSPPM0_LPA16_LPB16_LPM0_LRVW8_LWPMn1_MIAV0_MIWT8_8_MO40_NTn1_NTA0_NTB0_NTC0_NTD4_NTM0_NEPBS0_NLCA1_NLCB1_ONLL1_PGR2_PLR1_PKA1_SIA3_SS1_SU0_SUM0_SUS128_SPO0_SRVW0_SSO0_SVW8_SK3_SKXCCM0_TLDS1_ULSGRO0_USL1_UIOFGRO0_USFGRO0_VSn1_VWA8_VWB8_WSGRA0_WSGRB0_WS64_WG32_8_1_WGM16_WGMXCC2_WGMXCCGn1
     --kernel name:    Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x256x64_MI16x16x1_CMS_SN_LDSB0_AFC1_AFEM1_AFEM1_ASEM1_CLR1_CADS0_DTLA1_DTLB1_DTVA0_DTVB0_EPS0_FDSI0_GRPM1_GRVWA8_GRVWB8_GSU0_GSUAMB_GLS0_ISA950_IU1_K1_LBSPPA1024_LBSPPB1024_LBSPPM0_LPA16_LPB16_LPM0_LRVW8_LWPMn1_MIAV0_MIWT8_8_MO40_NTn1_NTA0_NTB0_NTC0_NTD4_NTM0_NEPBS0_NLCA1_NLCB1_ONLL1_PGR2_PLR1_PKA1_SIA3_SS1_SPO0_SRVW0_SSO0_SVW8_SK3_SKXCCM0_TLDS1_ULSGRO0_USL1_UIOFGRO0_USFGRO0_VSn1_VWA8_VWB8_WSGRA0_WSGRB0_WS64_WG32_8_1

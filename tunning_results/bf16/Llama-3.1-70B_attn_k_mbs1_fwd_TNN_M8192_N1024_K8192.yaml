@@ -11,7 +11,7 @@ GlobalParameters:
   CSVExportWinner: 1 # Lorri: save the winner
   CSVMergeSameProblemID: 1
   Device: 0 # Lorri: must do everything on the same GPU, avoid GPU 2 GPU difference
-  RotatingBufferSize: 1100 # Lorri:  Note 1: should be larger than LLC, need to change higher for future GPU, Note 2: some Grouped gemm is very laerge, 512M may not be enough and failure would be druing data init phase, seting here to 5GB
+  RotatingBufferSize: 1320 # Lorri:  Note 1: should be larger than LLC, need to change higher for future GPU, Note 2: some Grouped gemm is very laerge, 512M may not be enough and failure would be druing data init phase, seting here to 5GB
   SleepPercent: 0 # Lorri: we don't pause, more like real situation
   PrintLevel: 1
   PrintSolutionRejectionReason: True
